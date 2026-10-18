@@ -1,0 +1,27 @@
+{
+  "jev-intent-router": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node \"$HOME/.gemini/config/plugins/jev-coprocessor/bin/jev-hook.mjs\" PreInvocation",
+        "timeout": 6
+      }
+    ]
+  },
+  "jev-tool-guardrail": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "replace_file_content|multi_replace_file_content|write_to_file|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$HOME/.gemini/config/plugins/jev-coprocessor/bin/jev-hook.mjs\" PreToolUse",
+            "timeout": 6
+          }
+        ]
+      }
+    ]
+  }
+}
