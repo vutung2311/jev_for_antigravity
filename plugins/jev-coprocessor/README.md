@@ -15,8 +15,9 @@ Integrates TypeSafe's **Jev** (`jev-latest`, System One model) into Antigravity 
    - **Question-First Lock Enforcement**: Blocks unrequested file edits (`decision: "deny"`) during investigatory/explanatory question turns until the user asks to apply changes.
    - **Code Edit Gate (`write_to_file`, `replace_file_content`, `multi_replace_file_content`)**: Scores proposed diffs against 6 universal quality invariants (`has_narrative_comments`, `has_apology_or_hack_comments`, `has_else_after_return`, `has_err_nil_happy_path`, `swallows_error_silently`, `uses_raw_errors_new_in_go`) and blocks (`decision: "deny"`) violations before disk write.
    - **Shell Command Gate & Zero-Turn Auto-Sanitization (`run_command`)**:
+     - Fast whitelist bypass skips remote evaluation for read-only inspection commands (`ls`, `cat`, `rg`, `grep`, `find`, `diff`, `sed -n`, `lscpu`, `lspci`, `uname`, and `git -C <path>` inspection subcommands).
      - Escalates destructive deletes (`rm -rf`, schema drops) and remote force-pushes (`git push --force`) to `decision: "force_ask"`.
-     - Uses `PreToolUse` `overwrite: { CommandLine: ... }` to **auto-sanitize** trailing `|| true` on test/build/linter commands and rewrite `sudo <cmd>` to `pkexec <cmd>` in-place without burning an extra LLM retry turn.
+     - Uses `PreToolUse` `overwrite: { CommandLine: ... }` to **auto-sanitize** trailing `|| true` on test/build/linter commands and dynamically rewrite `sudo <cmd>` to `pkexec <cmd>` (or `run0 <cmd>` when `NoNewPrivs=1` is detected) in-place without burning an extra LLM retry turn.
 
 3. **Content-Addressed 60s Response Cache (`/tmp/jev-response-cache.json`)**:
    - Hashes `{ model, state, questions }` with SHA-256 and serves identical evaluations within 60 seconds in `<5ms` with zero API cost.

@@ -38,6 +38,12 @@ const SAFE_CMD_PREFIXES = [
   'rg ',
   'grep ',
   'find ',
+  'diff ',
+  'sed -n',
+  'uname',
+  'lscpu',
+  'lspci',
+  'lsblk',
   'git status',
   'git diff',
   'git log',
@@ -64,6 +70,46 @@ const SAFE_CMD_PREFIXES = [
   'make go-test',
   'make go-lint',
 ];
+
+function getPrivilegeEscalationTool() {
+  if (process.env.PRIVILEGE_ESCALATION) {
+    return process.env.PRIVILEGE_ESCALATION;
+  }
+  if (!fs.existsSync('/proc/self/status')) {
+    return 'pkexec';
+  }
+  try {
+    const status = fs.readFileSync('/proc/self/status', 'utf8');
+    if (/NoNewPrivs:\s*1/i.test(status)) {
+      return 'run0';
+    }
+    return 'pkexec';
+  } catch (err) {
+    return 'pkexec';
+  }
+}
+
+function isSafeCommand(cmd) {
+  if (
+    !cmd ||
+    cmd.includes('|| true') ||
+    cmd.includes('rm ') ||
+    cmd.includes('--force') ||
+    cmd.startsWith('sudo ')
+  ) {
+    return false;
+  }
+
+  if (SAFE_CMD_PREFIXES.some((prefix) => cmd.startsWith(prefix))) {
+    return true;
+  }
+
+  if (/^git\s+(?:-C\s+\S+\s+)?(?:status|diff|log|branch|show)\b/.test(cmd)) {
+    return true;
+  }
+
+  return false;
+}
 
 const STOPWORDS = new Set([
   'the', 'and', 'for', 'with', 'that', 'this', 'from', 'what', 'when', 'where',
@@ -941,13 +987,7 @@ async function handlePreToolUse(payload) {
     if (!cmd) {
       return { decision: 'allow' };
     }
-    if (
-      SAFE_CMD_PREFIXES.some((prefix) => cmd.startsWith(prefix)) &&
-      !cmd.includes('|| true') &&
-      !cmd.includes('rm ') &&
-      !cmd.includes('--force') &&
-      !cmd.startsWith('sudo ')
-    ) {
+    if (isSafeCommand(cmd)) {
       return { decision: 'allow' };
     }
 
@@ -990,10 +1030,11 @@ async function handlePreToolUse(payload) {
           uses_sudo_instead_of_pkexec: {
             type: 'noul',
             instructions:
-              'Does `command_line` invoke `sudo` to run a privileged command on Linux instead of `pkexec`?',
+              'Does `command_line` invoke `sudo` to run a privileged command on Linux instead of a polkit/systemd privilege escalation tool such as `pkexec` or `run0`?',
             criteria: {
               true: 'Invokes `sudo <command>` for root privileges',
-              false: 'Does not invoke `sudo`',
+              false:
+                'Does not invoke `sudo` (e.g. invokes `pkexec`, `run0`, or unprivileged commands)',
             },
           },
         },
@@ -1048,12 +1089,13 @@ async function handlePreToolUse(payload) {
       }
 
       if (usesSudo >= 0.92 && /^sudo\s+(?!-)/.test(cmd)) {
-        const sanitizedCmd = cmd.replace(/^sudo\s+/, 'pkexec ');
+        const escalationTool = getPrivilegeEscalationTool();
+        const sanitizedCmd = cmd.replace(/^sudo\s+/, `${escalationTool} `);
         logTelemetry({
           hook: 'PreToolUse:command:overwrite',
           originalCommand: cmd,
           sanitizedCommand: sanitizedCmd,
-          reason: 'rewrite_sudo_to_pkexec',
+          reason: `rewrite_sudo_to_${escalationTool}`,
         });
         return {
           decision: 'allow',
