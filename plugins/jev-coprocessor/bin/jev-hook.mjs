@@ -29,48 +29,6 @@ const CODE_EXTENSIONS = new Set([
   '.sh',
 ]);
 
-const SAFE_CMD_PREFIXES = [
-  'ls',
-  'pwd',
-  'cat ',
-  'head ',
-  'tail ',
-  'rg ',
-  'grep ',
-  'find ',
-  'diff ',
-  'sed -n',
-  'uname',
-  'lscpu',
-  'lspci',
-  'lsblk',
-  'git status',
-  'git diff',
-  'git log',
-  'git branch',
-  'git show',
-  'node -v',
-  'go test',
-  'go vet',
-  'golangci-lint',
-  'cargo test',
-  'cargo check',
-  'cargo clippy',
-  'pytest',
-  'npm test',
-  'pnpm test',
-  'yarn test',
-  'npx tsc',
-  'dart analyze',
-  'dart test',
-  'flutter test',
-  'make analyze',
-  'make test',
-  'make lint',
-  'make go-test',
-  'make go-lint',
-];
-
 function getPrivilegeEscalationTool() {
   if (process.env.PRIVILEGE_ESCALATION) {
     return process.env.PRIVILEGE_ESCALATION;
@@ -84,31 +42,9 @@ function getPrivilegeEscalationTool() {
       return 'run0';
     }
     return 'pkexec';
-  } catch (err) {
+  } catch {
     return 'pkexec';
   }
-}
-
-function isSafeCommand(cmd) {
-  if (
-    !cmd ||
-    cmd.includes('|| true') ||
-    cmd.includes('rm ') ||
-    cmd.includes('--force') ||
-    cmd.startsWith('sudo ')
-  ) {
-    return false;
-  }
-
-  if (SAFE_CMD_PREFIXES.some((prefix) => cmd.startsWith(prefix))) {
-    return true;
-  }
-
-  if (/^git\s+(?:-C\s+\S+\s+)?(?:status|diff|log|branch|show)\b/.test(cmd)) {
-    return true;
-  }
-
-  return false;
 }
 
 const STOPWORDS = new Set([
@@ -234,23 +170,105 @@ function cleanPromptText(text) {
     .trim();
 }
 
-function getLatestUserInput(payload) {
+function extractTranscriptContext(payload, workspaceRoot) {
+  const ctx = {
+    latestUserInput: null,
+    turnsSinceUserInput: 0,
+    consecutiveSearchTurns: 0,
+    recentFiles: [],
+    secondaryRoots: [],
+    recentContextSummary: '',
+  };
+
+  const recentFileSet = new Set();
+  const secondaryRootSet = new Set();
   const transcriptPath = payload?.transcriptPath;
+
   if (transcriptPath && fs.existsSync(transcriptPath)) {
     try {
       const content = fs.readFileSync(transcriptPath, 'utf8').trim();
       if (content) {
         const lines = content.split(/\r?\n/);
-        for (
-          let i = lines.length - 1;
-          i >= Math.max(0, lines.length - 6);
-          i--
-        ) {
-          const step = JSON.parse(lines[i]);
-          if (step.type === 'PLANNER_RESPONSE' || step.type === 'TOOL_CALL') {
-            return null;
+        const startIdx = Math.max(0, lines.length - 24);
+        let foundLatestUser = false;
+        let streakSearching = true;
+
+        for (let i = lines.length - 1; i >= startIdx; i--) {
+          let step;
+          try {
+            step = JSON.parse(lines[i]);
+          } catch {
+            continue;
           }
+
+          if (Array.isArray(step.tool_calls)) {
+            let turnOnlySearched = step.tool_calls.length > 0;
+            for (const tc of step.tool_calls) {
+              const tName = tc?.name || '';
+              const tArgs = tc?.arguments || tc?.args || {};
+              const fPath = tArgs?.Path || tArgs?.TargetFile || '';
+              if (
+                fPath &&
+                typeof fPath === 'string' &&
+                !fPath.includes('/brain/') &&
+                fs.existsSync(fPath)
+              ) {
+                recentFileSet.add(fPath);
+              }
+              const cmd = tArgs?.CommandLine || '';
+              if (typeof cmd === 'string' && cmd) {
+                const gitC = cmd.match(/\bgit\s+-C\s+([^\s;&|]+)/);
+                if (gitC && fs.existsSync(gitC[1])) {
+                  secondaryRootSet.add(gitC[1]);
+                }
+                const cdMatch = cmd.match(/^\s*cd\s+([^\s;&|]+)/);
+                if (cdMatch && fs.existsSync(cdMatch[1])) {
+                  secondaryRootSet.add(cdMatch[1]);
+                }
+              }
+              const isSearchTool =
+                tName === 'read_file' ||
+                tName === 'view_file' ||
+                tName === 'grep_search' ||
+                tName === 'find_by_name' ||
+                (tName === 'run_command' &&
+                  /^\s*(?:cd\s+[^\s;&|]+\s*&&\s*)?(?:rg|grep|git\s+(?:-C\s+[^\s]+\s+)?grep|find|ls)\b/.test(
+                    cmd
+                  ));
+              if (!isSearchTool) {
+                turnOnlySearched = false;
+              }
+            }
+            if (!foundLatestUser) {
+              ctx.turnsSinceUserInput++;
+              if (streakSearching && turnOnlySearched) {
+                ctx.consecutiveSearchTurns++;
+              } else {
+                streakSearching = false;
+              }
+            }
+          } else if (
+            step.type === 'PLANNER_RESPONSE' ||
+            step.type === 'TOOL_CALL'
+          ) {
+            if (!foundLatestUser) {
+              ctx.turnsSinceUserInput++;
+            }
+            if (
+              foundLatestUser &&
+              !ctx.recentContextSummary &&
+              typeof step.content === 'string' &&
+              step.content.trim()
+            ) {
+              ctx.recentContextSummary = step.content
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 320);
+            }
+          }
+
           if (
+            !foundLatestUser &&
             (step.type === 'USER_INPUT' ||
               (step.step_index === 0 && step.type === 'SYSTEM_MESSAGE')) &&
             step.content
@@ -261,50 +279,133 @@ function getLatestUserInput(payload) {
                 : JSON.stringify(step.content);
             const cleaned = cleanPromptText(text);
             if (cleaned) {
-              return cleaned;
+              foundLatestUser = true;
+              if (ctx.turnsSinceUserInput === 0) {
+                ctx.latestUserInput = cleaned;
+              }
             }
           }
         }
-        return null;
       }
     } catch {
-      // fall through to subagent message check
+      // fall through
     }
   }
 
-  if ((payload?.initialNumSteps ?? 0) <= 1) {
-    const initMsg = getSubagentInitialMessage(payload);
-    if (initMsg) {
-      return cleanPromptText(initMsg) || null;
+  if (!ctx.latestUserInput && ctx.turnsSinceUserInput === 0) {
+    if ((payload?.initialNumSteps ?? 0) <= 1) {
+      const initMsg = getSubagentInitialMessage(payload);
+      if (initMsg) {
+        ctx.latestUserInput = cleanPromptText(initMsg) || null;
+      }
+    }
+    if (
+      !ctx.latestUserInput &&
+      typeof payload?.userPrompt === 'string' &&
+      payload.userPrompt.trim()
+    ) {
+      ctx.latestUserInput = cleanPromptText(payload.userPrompt) || null;
     }
   }
-  if (typeof payload?.userPrompt === 'string' && payload.userPrompt.trim()) {
-    return cleanPromptText(payload.userPrompt) || null;
-  }
-  return null;
+
+  ctx.recentFiles = [...recentFileSet].slice(0, 5);
+  ctx.secondaryRoots = [...secondaryRootSet].filter(
+    (r) => r !== workspaceRoot
+  );
+  return ctx;
 }
 
-function extractDirectoryHints(userMessage, workspaceRoot) {
+function extractPrioritizedKeywords(userMessage, recentContextSummary = '') {
+  const combined = `${userMessage} ${recentContextSummary}`;
+  const backtickMatches = [
+    ...userMessage.matchAll(/`([a-zA-Z0-9_./:-]{3,64})`/g),
+  ].map((m) => m[1]);
+
+  const rawTokens = combined
+    .replace(/[^a-zA-Z0-9_./-]/g, ' ')
+    .split(/\s+/)
+    .map((t) => t.replace(/^[.,:;!?()[\]]+|[.,:;!?()[\]]+$/g, ''))
+    .filter(
+      (t) =>
+        t.length >= 3 &&
+        !STOPWORDS.has(t.toLowerCase()) &&
+        !/^\d+$/.test(t)
+    );
+
+  const scored = new Map();
+  const addToken = (tok, bonus = 0) => {
+    const clean = tok.includes('/') ? path.basename(tok) : tok;
+    const base = clean.replace(/\.[a-z0-9]+$/i, '');
+    if (base.length < 3 || STOPWORDS.has(base.toLowerCase())) {
+      return;
+    }
+    let score = bonus;
+    if (/[a-z][A-Z]/.test(base) || /[A-Z]{2,}[a-z]/.test(base)) {
+      score += 50; // camelCase / PascalCase identifier
+    }
+    if (base.includes('_') || base.includes('-')) {
+      score += 40; // snake_case / kebab-case identifier
+    }
+    if (/\.[a-z]{1,4}$/i.test(clean)) {
+      score += 35; // explicit filename
+    }
+    score += Math.min(base.length, 18);
+    const prev = scored.get(base) || 0;
+    if (score > prev) {
+      scored.set(base, score);
+    }
+  };
+
+  for (const bt of backtickMatches) {
+    addToken(bt, 60);
+  }
+  for (const tok of rawTokens) {
+    addToken(tok, 10);
+  }
+
+  return [...scored.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([k]) => k);
+}
+
+function extractDirectoryHints(userMessage, workspaceRoot, secondaryRoots = []) {
   const hints = [];
+  const roots = [workspaceRoot, ...secondaryRoots].filter(Boolean);
+  const absPaths =
+    userMessage.match(/\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+/g) || [];
+  for (const rawAbs of absPaths) {
+    const cleanAbs = rawAbs.replace(/[.,:;!?)]+$/, '');
+    if (fs.existsSync(cleanAbs) && !cleanAbs.includes('/brain/')) {
+      const stat = fs.statSync(cleanAbs);
+      hints.push(stat.isDirectory() ? cleanAbs : path.dirname(cleanAbs));
+    }
+  }
+
   const pathTokens =
     userMessage.match(/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+/g) || [];
   for (const rawToken of pathTokens) {
     const cleanToken = rawToken.replace(/[.,:;!?)]+$/, '');
-    const candidatePath = path.resolve(workspaceRoot, cleanToken);
-    if (!candidatePath.startsWith(workspaceRoot)) {
-      continue;
-    }
-    if (fs.existsSync(candidatePath)) {
-      const stat = fs.statSync(candidatePath);
-      hints.push(stat.isDirectory() ? candidatePath : path.dirname(candidatePath));
-      continue;
-    }
-    const parentDir = path.dirname(candidatePath);
-    if (parentDir.startsWith(workspaceRoot) && fs.existsSync(parentDir)) {
-      hints.push(parentDir);
+    for (const root of roots) {
+      const candidatePath = path.resolve(root, cleanToken);
+      if (!candidatePath.startsWith(root)) {
+        continue;
+      }
+      if (fs.existsSync(candidatePath)) {
+        const stat = fs.statSync(candidatePath);
+        hints.push(
+          stat.isDirectory() ? candidatePath : path.dirname(candidatePath)
+        );
+        break;
+      }
+      const parentDir = path.dirname(candidatePath);
+      if (parentDir.startsWith(root) && fs.existsSync(parentDir)) {
+        hints.push(parentDir);
+        break;
+      }
     }
   }
-  return [...new Set(hints)];
+  return [...new Set([...hints, ...secondaryRoots])];
 }
 
 function getGitDirtyFiles(workspaceRoot) {
@@ -345,18 +446,31 @@ function extractRankedSymbolsWithRanges(fileText, keywords) {
   const lines = fileText.split(/\r?\n/);
   const totalLines = lines.length;
   const symbolRegex =
-    /^(func\s+|type\s+\w+\s+(struct|interface)|export\s+(default\s+)?(async\s+)?(function|class|const|interface|type)\s+|(async\s+)?def\s+\w+|class\s+\w+|(pub(\([^)]+\))?\s+)?(async\s+)?(fn|struct|enum|trait|impl)\s+|(public|protected|private|static|\s)*function\s+\w+)/;
+    /^(?:func\s+|type\s+\w+\s+(?:struct|interface)|export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|interface|type)\s+|(?:async\s+)?(?:function|def)\s+\w+|class\s+\w+|(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl)\s+|(?:(?:public|protected|private|static|override|async)\s+)+(?:function\s+)?\w+\s*\()/;
 
   const rawSymbols = [];
   for (let i = 0; i < totalLines; i++) {
     const trimmed = lines[i].trim();
+    if (
+      !trimmed ||
+      trimmed.startsWith('//') ||
+      trimmed.startsWith('#') ||
+      trimmed.startsWith('/*') ||
+      trimmed.startsWith('*') ||
+      /^(if|for|while|switch|catch|return|else)\b/.test(trimmed)
+    ) {
+      continue;
+    }
     if (symbolRegex.test(trimmed)) {
       rawSymbols.push({
-        header: trimmed.replace(/\s*\{$/, '').slice(0, 85),
+        header: trimmed.replace(/\s*\{$/, '').slice(0, 80),
         startLine: i + 1,
       });
     }
   }
+
+  const lowerKeywords = keywords.map((kw) => kw.toLowerCase());
+  const matchPreviewLines = [];
 
   for (let i = 0; i < rawSymbols.length; i++) {
     const endLine =
@@ -364,55 +478,145 @@ function extractRankedSymbolsWithRanges(fileText, keywords) {
         ? rawSymbols[i + 1].startLine - 1
         : totalLines;
     const headerLower = rawSymbols[i].header.toLowerCase();
-    const kwHits = keywords.filter((kw) =>
-      headerLower.includes(kw.toLowerCase())
-    ).length;
+    let kwHits = 0;
+    const bodyHitLines = [];
+
+    for (const kw of lowerKeywords) {
+      if (headerLower.includes(kw)) {
+        kwHits += 3;
+      }
+    }
+
+    const scanLimit = Math.min(endLine, rawSymbols[i].startLine + 600);
+    for (let ln = rawSymbols[i].startLine; ln <= scanLimit; ln++) {
+      const lineText = lines[ln - 1] || '';
+      const lineLower = lineText.toLowerCase();
+      let matchedLine = false;
+      for (const kw of lowerKeywords) {
+        if (lineLower.includes(kw)) {
+          kwHits += 2;
+          matchedLine = true;
+        }
+      }
+      if (matchedLine && ln > rawSymbols[i].startLine) {
+        if (bodyHitLines.length < 3) {
+          bodyHitLines.push(ln);
+        }
+        if (matchPreviewLines.length < 3) {
+          const snippet = lineText.trim().slice(0, 90);
+          if (snippet) {
+            matchPreviewLines.push(`L${ln}: ${snippet}`);
+          }
+        }
+      }
+    }
+
     rawSymbols[i].endLine = endLine;
     rawSymbols[i].kwHits = kwHits;
+    rawSymbols[i].firstHitLine = bodyHitLines[0] || rawSymbols[i].startLine;
+    rawSymbols[i].hitNote =
+      bodyHitLines.length > 0
+        ? ` [hits: ${bodyHitLines.map((l) => `L${l}`).join(',')}]`
+        : '';
   }
 
-  return rawSymbols
+  if (matchPreviewLines.length === 0 && lowerKeywords.length > 0) {
+    for (let ln = 1; ln <= Math.min(totalLines, 1500); ln++) {
+      const lineText = lines[ln - 1] || '';
+      const lineLower = lineText.toLowerCase();
+      if (lowerKeywords.some((kw) => lineLower.includes(kw))) {
+        matchPreviewLines.push(`L${ln}: ${lineText.trim().slice(0, 90)}`);
+        if (matchPreviewLines.length >= 3) break;
+      }
+    }
+  }
+
+  const ranked = rawSymbols
     .sort((a, b) => b.kwHits - a.kwHits || a.startLine - b.startLine)
-    .slice(0, 8)
-    .sort((a, b) => a.startLine - b.startLine)
-    .map((s) => `L${s.startLine}-L${s.endLine}: ${s.header}`)
+    .slice(0, 6);
+
+  const topSym = ranked[0];
+  let primaryStart = topSym ? topSym.startLine : null;
+  let primaryEnd = topSym ? topSym.endLine : null;
+  if (topSym && primaryEnd - primaryStart > 180 && topSym.firstHitLine) {
+    primaryStart = Math.max(topSym.startLine, topSym.firstHitLine - 40);
+    primaryEnd = Math.min(topSym.endLine, topSym.firstHitLine + 120);
+  }
+
+  const symbols = ranked
+    .map((s) => `L${s.startLine}-L${s.endLine}: ${s.header}${s.hitNote}`)
     .join('; ');
+
+  return {
+    symbols,
+    matchPreview: matchPreviewLines.join(' | '),
+    totalLines,
+    primaryStart,
+    primaryEnd,
+  };
 }
 
-function findCandidateFilesWithSummaries(userMessage, workspaceRoot) {
+function findCandidateFilesWithSummaries(
+  userMessage,
+  workspaceRoot,
+  transcriptCtx = {}
+) {
   if (!workspaceRoot || !fs.existsSync(workspaceRoot)) {
     return [];
   }
   try {
-    const dirHints = extractDirectoryHints(userMessage, workspaceRoot);
+    const secondaryRoots = transcriptCtx.secondaryRoots || [];
+    const recentFiles = transcriptCtx.recentFiles || [];
+    const dirHints = extractDirectoryHints(
+      userMessage,
+      workspaceRoot,
+      secondaryRoots
+    );
     const searchPaths =
-      dirHints.length > 0 ? dirHints.slice(0, 3) : [workspaceRoot];
+      dirHints.length > 0
+        ? dirHints.slice(0, 4)
+        : [workspaceRoot, ...secondaryRoots.slice(0, 2)];
 
-    const tokens = userMessage
-      .replace(/[^a-zA-Z0-9_./-]/g, ' ')
-      .split(/\s+/)
-      .map((t) => t.trim())
-      .filter(
-        (t) =>
-          t.length >= 4 &&
-          !STOPWORDS.has(t.toLowerCase()) &&
-          !t.includes('/')
-      );
-
-    const uniqueKeywords = [...new Set(tokens)].slice(0, 7);
+    const uniqueKeywords = extractPrioritizedKeywords(
+      userMessage,
+      transcriptCtx.recentContextSummary || ''
+    );
     const dirtyMap = getGitDirtyFiles(workspaceRoot);
+    for (const secRoot of secondaryRoots.slice(0, 2)) {
+      for (const [k, v] of getGitDirtyFiles(secRoot).entries()) {
+        dirtyMap.set(k, v);
+      }
+    }
     const candidateMap = new Map();
 
-    for (const [absFile, gitStatus] of dirtyMap.entries()) {
-      const relFile = path.relative(workspaceRoot, absFile);
+    for (const absFile of recentFiles) {
+      const relFile = absFile.startsWith(workspaceRoot)
+        ? path.relative(workspaceRoot, absFile)
+        : absFile;
       const keywordHits = uniqueKeywords.filter((kw) =>
         relFile.toLowerCase().includes(kw.toLowerCase())
       ).length;
       candidateMap.set(absFile, {
         absFile,
         relFile,
+        gitStatus: dirtyMap.get(absFile) || 'recent_context',
+        rankScore: 45 + keywordHits * 45,
+      });
+    }
+
+    for (const [absFile, gitStatus] of dirtyMap.entries()) {
+      const relFile = absFile.startsWith(workspaceRoot)
+        ? path.relative(workspaceRoot, absFile)
+        : absFile;
+      const keywordHits = uniqueKeywords.filter((kw) =>
+        relFile.toLowerCase().includes(kw.toLowerCase())
+      ).length;
+      const prev = candidateMap.get(absFile);
+      candidateMap.set(absFile, {
+        absFile,
+        relFile,
         gitStatus,
-        rankScore: 25 + keywordHits * 45,
+        rankScore: Math.max(prev?.rankScore || 0, 25 + keywordHits * 45),
       });
     }
 
@@ -480,7 +684,9 @@ function findCandidateFilesWithSummaries(userMessage, workspaceRoot) {
           if (lastColon === -1) continue;
           const absFile = line.slice(0, lastColon);
           const count = parseInt(line.slice(lastColon + 1), 10) || 0;
-          const relFile = path.relative(workspaceRoot, absFile);
+          const relFile = absFile.startsWith(workspaceRoot)
+            ? path.relative(workspaceRoot, absFile)
+            : absFile;
           const keywordHits = uniqueKeywords.filter((kw) =>
             relFile.toLowerCase().includes(kw.toLowerCase())
           ).length;
@@ -502,9 +708,21 @@ function findCandidateFilesWithSummaries(userMessage, workspaceRoot) {
 
     return candidates.map((c) => {
       let symbols = '';
+      let matchPreview = '';
+      let totalLines = 0;
+      let primaryStart = null;
+      let primaryEnd = null;
       try {
         const fileText = fs.readFileSync(c.absFile, 'utf8');
-        symbols = extractRankedSymbolsWithRanges(fileText, uniqueKeywords);
+        const extracted = extractRankedSymbolsWithRanges(
+          fileText,
+          uniqueKeywords
+        );
+        symbols = extracted.symbols;
+        matchPreview = extracted.matchPreview;
+        totalLines = extracted.totalLines;
+        primaryStart = extracted.primaryStart;
+        primaryEnd = extracted.primaryEnd;
       } catch {
         symbols = '';
       }
@@ -513,6 +731,10 @@ function findCandidateFilesWithSummaries(userMessage, workspaceRoot) {
         absFile: c.absFile,
         gitStatus: c.gitStatus,
         symbols,
+        matchPreview,
+        totalLines,
+        primaryStart,
+        primaryEnd,
       };
     });
   } catch {
@@ -593,18 +815,71 @@ async function handlePreInvocation(payload) {
     return {};
   }
 
-  const userMessage = getLatestUserInput(payload);
-  if (!userMessage || userMessage.length < 4) {
-    return {};
-  }
-
   const workspaceRoot =
     (Array.isArray(payload.workspacePaths) && payload.workspacePaths[0]) ||
     process.cwd();
 
+  const transcriptCtx = extractTranscriptContext(payload, workspaceRoot);
+  const userMessage = transcriptCtx.latestUserInput;
+
+  // Turn 2+ stateful continuation & loop-breaker (zero API cost)
+  if (!userMessage) {
+    const sessionState = getSessionState(payload?.conversationId);
+    if (transcriptCtx.consecutiveSearchTurns >= 4) {
+      const savedFiles = (sessionState?.topFiles || [])
+        .map((f) => `${f.file}${f.primaryRange ? ` (${f.primaryRange})` : ''}`)
+        .join(', ');
+      const targetNote = savedFiles ? ` Target files: ${savedFiles}.` : '';
+      logTelemetry({
+        hook: 'PreInvocation:loop_breaker',
+        turnsSinceUserInput: transcriptCtx.turnsSinceUserInput,
+        consecutiveSearchTurns: transcriptCtx.consecutiveSearchTurns,
+      });
+      return {
+        injectSteps: [
+          {
+            ephemeralMessage: `[JEV CONVERGENCE GUARD] You have spent ${transcriptCtx.consecutiveSearchTurns} consecutive turns running searches.${targetNote} Stop serial grep/search calls: batch any final read_file/view_file calls now and proceed directly to your edit or final answer.`,
+          },
+        ],
+      };
+    }
+    if (
+      transcriptCtx.turnsSinceUserInput === 1 &&
+      sessionState?.turn2Reminder
+    ) {
+      return {
+        injectSteps: [
+          {
+            ephemeralMessage: sessionState.turn2Reminder,
+          },
+        ],
+      };
+    }
+    return {};
+  }
+
+  if (userMessage.length < 4) {
+    return {};
+  }
+
+  // Fast local short-circuit for trivial approvals or git ops (<1ms, 0 API cost)
+  if (
+    userMessage.length < 65 &&
+    /^(yes|yep|ok|okay|sure|please\s+proceed|proceed|go\s+ahead|do\s+it|lgtm|commit(\s+and\s+push)?|push\s+to\s+.*|make\s+a?\s*pr|create\s+a?\s*pr)\b/i.test(
+      userMessage.trim()
+    )
+  ) {
+    setSessionState(payload?.conversationId, {
+      readOnlyQuestionTurn: false,
+      executionMode: 'conversational_or_git_ops',
+    });
+    return {};
+  }
+
   const candidates = findCandidateFilesWithSummaries(
     userMessage,
-    workspaceRoot
+    workspaceRoot,
+    transcriptCtx
   );
 
   const questions = {
@@ -629,7 +904,8 @@ async function handlePreInvocation(payload) {
         'Does `user_prompt` already specify the exact file paths to create and the complete business logic rules so no codebase search is needed?',
       criteria: {
         true: 'Exact target file path(s) and full function/logic specification are explicitly stated in `user_prompt`',
-        false: 'Requires inspecting existing repository files or answering a question',
+        false:
+          'Requires inspecting existing repository files or answering a question',
       },
     },
     is_investigatory_question_only: {
@@ -638,7 +914,31 @@ async function handlePreInvocation(payload) {
         'Is `user_prompt` asking an investigatory, diagnostic, or explanatory question ("why", "how", "what if", "find out if") where the assistant should answer in text FIRST without modifying any files?',
       criteria: {
         true: 'Pure question, audit, or brainstorming request; user has NOT asked to apply code edits right now',
-        false: 'User explicitly asks to implement, edit, fix, create, update, commit, or proceed with changes',
+        false:
+          'User explicitly asks to implement, edit, fix, create, update, commit, or proceed with changes',
+      },
+    },
+    is_underspecified_or_ambiguous: {
+      type: 'noul',
+      instructions:
+        'Does `user_prompt` ask to build or change something with multiple conflicting architectural choices or critical missing requirements where the assistant should ask a clarifying question BEFORE writing code?',
+      criteria: {
+        true: 'Vague or ambiguous change request with critical unstated requirements that require user clarification first',
+        false:
+          'Clear bug fix, specific edit, self-contained spec, or read-only question that can be executed or answered directly',
+      },
+    },
+    verification_strategy: {
+      type: 'choice',
+      instructions:
+        'What is the most token-efficient verification step after completing `user_prompt`?',
+      criteria: {
+        none_needed:
+          'Read-only question, documentation/config edit, or conversational turn requiring no test execution',
+        targeted_unit_test:
+          'Run only the specific unit test file or package touched by the change (never the entire monorepo suite)',
+        typecheck_or_lint_only:
+          'Run a fast static analyzer or typechecker on the modified package',
       },
     },
   };
@@ -648,8 +948,8 @@ async function handlePreInvocation(payload) {
       type: 'noul',
       instructions: `Is \`candidate_files[${idx}]\` (${cand.file}) a primary file that must be read or edited to fulfill \`user_prompt\`?`,
       criteria: {
-        true: 'Defines or configures the exact logic, symbols, or pending changes targeted by `user_prompt`',
-        false: 'Unrelated or merely shares a generic keyword',
+        true: 'Contains matching code/symbols (see `symbols` and `match_preview`), pending git changes, or recent context targeted by `user_prompt`',
+        false: 'Unrelated file with no relevant symbol or snippet matches',
       },
     };
   });
@@ -659,10 +959,14 @@ async function handlePreInvocation(payload) {
       state: {
         workspace_name: path.basename(workspaceRoot),
         user_prompt: userMessage.slice(0, 4000),
+        ...(transcriptCtx.recentContextSummary
+          ? { recent_context: transcriptCtx.recentContextSummary }
+          : {}),
         candidate_files: candidates.map((c) => ({
           file: c.file,
           git_status: c.gitStatus,
           symbols: c.symbols,
+          ...(c.matchPreview ? { match_preview: c.matchPreview } : {}),
         })),
       },
       questions,
@@ -673,21 +977,60 @@ async function handlePreInvocation(payload) {
     const isSelfContained = res.answers?.is_self_contained_spec?.noul ?? 0;
     const isQuestionOnly =
       res.answers?.is_investigatory_question_only?.noul ?? 0;
+    const isAmbiguous =
+      res.answers?.is_underspecified_or_ambiguous?.noul ?? 0;
+    const verifyStrategy =
+      res.answers?.verification_strategy?.choice || 'targeted_unit_test';
 
     const topFiles = candidates
-      .map((c, idx) => ({
-        ...c,
-        prob: res.answers?.[`cand_file_${idx}`]?.noul ?? 0,
-      }))
-      .filter((f) => f.prob >= 0.72)
+      .map((c, idx) => {
+        const startLine = c.primaryStart;
+        const endLine = c.primaryEnd;
+        return {
+          ...c,
+          prob: res.answers?.[`cand_file_${idx}`]?.noul ?? 0,
+          primaryRange:
+            startLine && endLine ? `L${startLine}-L${endLine}` : '',
+          startLine,
+          endLine,
+        };
+      })
+      .filter((f) => f.prob >= 0.6)
       .sort((a, b) => b.prob - a.prob)
       .slice(0, 4);
 
     const readOnlyLock =
       mode === 'codebase_audit_or_answer' && isQuestionOnly >= 0.88;
+
+    const applicableRules = discoverApplicableRules(workspaceRoot, topFiles);
+    const rulesNote =
+      applicableRules.length > 0
+        ? ` (Rules: ${applicableRules.join(', ')})`
+        : '';
+
+    const turn2Reminder =
+      mode === 'direct_code_write' || isSelfContained >= 0.75
+        ? `[JEV TURN-2 PLAN] Run the targeted verification test command now, then output the final summary and stop.`
+        : readOnlyLock
+          ? `[JEV TURN-2 PLAN] Read-Only Question Mode active. Synthesize your technical answer directly from the slices read without modifying files.`
+          : topFiles.length > 0
+            ? `[JEV TURN-2 PLAN] Edit target slices (${topFiles.map((f) => path.basename(f.file)).join(', ')})${rulesNote}. Verify with: ${verifyStrategy}.`
+            : '';
+
     setSessionState(payload?.conversationId, {
       readOnlyQuestionTurn: readOnlyLock,
       executionMode: mode,
+      verifyStrategy,
+      turn2Reminder,
+      topFiles: topFiles.map((f) => ({
+        file: f.file,
+        absFile: f.absFile,
+        prob: f.prob,
+        primaryRange: f.primaryRange,
+        startLine: f.startLine,
+        endLine: f.endLine,
+        totalLines: f.totalLines,
+      })),
     });
 
     logTelemetry({
@@ -700,6 +1043,8 @@ async function handlePreInvocation(payload) {
       executionMode: mode,
       isSelfContained,
       isQuestionOnly,
+      isAmbiguous,
+      verifyStrategy,
       readOnlyLock,
       topFiles: topFiles.map((f) => ({
         file: f.file,
@@ -712,10 +1057,9 @@ async function handlePreInvocation(payload) {
       return {};
     }
 
-    const applicableRules = discoverApplicableRules(workspaceRoot, topFiles);
-    const rulesNote =
-      applicableRules.length > 0
-        ? ` (Applicable Workspace Rules: ${applicableRules.join(', ')})`
+    const clarifyNote =
+      isAmbiguous >= 0.85 && mode === 'codebase_edit'
+        ? `\n- AMBIGUITY ALERT (p=${isAmbiguous.toFixed(2)}): Requirements appear underspecified. Inspect the primary file slice below once, then ask a concise clarifying question before making broad architectural changes.`
         : '';
 
     let directive = '';
@@ -723,19 +1067,18 @@ async function handlePreInvocation(payload) {
       const mentionsGo =
         /\.go\b|\bpackage\s+\w+|\bgo\s+test\b/i.test(userMessage);
       directive = [
-        `[JEV SYSTEM-1 EXECUTIVE DECISION PLAN (${res.latencyMs}ms) — OBEY STRICTLY]`,
-        `- Decision: DIRECT_CODE_WRITE (Self-Contained Specification, p=${isSelfContained.toFixed(2)})${rulesNote}.`,
-        `- STRICT PROHIBITIONS: Do NOT run exploratory grep, rg, find, ls, or cat. Do NOT read unrelated SKILL.md files or MCP tool schemas.`,
-        `- TURN 1 (MANDATORY): Call write_to_file IN PARALLEL for all requested implementation and test files right now in Turn 1 (omit ArtifactMetadata for non-artifact files).`,
+        `[JEV SYSTEM-1 EXECUTIVE PLAN (${res.latencyMs}ms) — OBEY STRICTLY]`,
+        `- Mode: DIRECT_CODE_WRITE (Self-Contained Spec, p=${isSelfContained.toFixed(2)})${rulesNote}.`,
+        `- PROHIBITIONS: Zero exploratory grep/rg/find/ls/cat. Zero unrelated SKILL.md or MCP schema reads.`,
+        `- TURN 1: Call write_file / write_to_file IN PARALLEL for all requested implementation & test files right now (omit ArtifactMetadata).`,
         ...(mentionsGo
           ? [
-              `  * Go Standards: signature must be (ctx context.Context, input XInput) (*XOutput, error); define typed domain error sentinels (type DomainError string) instead of raw errors.New; use early-return guard clauses with zero else-after-return and zero narrative comments.`,
+              `  * Go Rules: signature (ctx context.Context, input XInput) (*XOutput, error); typed domain error sentinels (type DomainError string) instead of raw errors.New; flat guard clauses, zero else-after-return, zero narrative comments.`,
             ]
           : [
-              `  * Code Standards: use early-return guard clauses with zero else-after-return and zero narrative/apology comments.`,
+              `  * Code Rules: flat early-return guard clauses, zero else-after-return, zero narrative/apology comments.`,
             ]),
-        `- TURN 2 (MANDATORY): Call run_command to execute the verification/test command specified in the prompt.`,
-        `- TURN 3 (MANDATORY): Call send_message (if subagent) or output the final summary and terminate immediately.`,
+        `- TURN 2: Run the verification test command, then finish immediately.`,
       ].join('\n');
     } else if (mode === 'codebase_audit_or_answer' || readOnlyLock) {
       const fileLines = topFiles.map(
@@ -743,18 +1086,17 @@ async function handlePreInvocation(payload) {
           `  * ${f.absFile} (p=${f.prob.toFixed(2)}, git=${f.gitStatus}) [${f.symbols || 'source file'}]`
       );
       directive = [
-        `[JEV SYSTEM-1 EXECUTIVE DECISION PLAN (${res.latencyMs}ms) — OBEY STRICTLY]`,
-        `- Decision: CODEBASE_AUDIT_OR_ANSWER (Read-Only Question-First Mode, Workspace=${path.basename(workspaceRoot)})${rulesNote}.`,
-        `- STRICT PROHIBITIONS: Answer the user's question/audit in text FIRST. Do NOT modify any files or run mutating commands during this turn. Do NOT read unrelated SKILL.md files or MCP tool schemas.`,
+        `[JEV SYSTEM-1 EXECUTIVE PLAN (${res.latencyMs}ms) — OBEY STRICTLY]`,
+        `- Mode: CODEBASE_AUDIT_OR_ANSWER (Read-Only Question-First, Workspace=${path.basename(workspaceRoot)})${rulesNote}.`,
+        `- PROHIBITIONS: Answer in text FIRST. Do NOT edit files or run mutating commands. Do NOT read unrelated SKILL.md or MCP schemas.`,
         ...(fileLines.length > 0
           ? [
-              `- Jev Pre-Ranked Primary Files & Symbol Line Ranges (Confidence >= 0.72):`,
+              `- Pre-Ranked Files & Symbol Line Ranges:`,
               ...fileLines,
-              `- TURN 1 (MANDATORY): Call view_file IN A SINGLE PARALLEL BATCH on the Jev Pre-Ranked Primary Files above using their L<start>-L<end> line ranges where applicable. Do NOT read files one-by-one across serial turns.`,
-              `- TURN 2-3 (MANDATORY): Read any directly referenced callee file in one batch, then synthesize the complete technical answer and finish immediately.`,
+              `- TURN 1: Call read_file / view_file IN A SINGLE PARALLEL BATCH using StartLine/EndLine from the L<start>-L<end> ranges above. Never read files one-by-one across serial turns.`,
             ]
           : [
-              `- TURN 1: Run a single targeted rg search and batch all view_file calls in parallel.`,
+              `- TURN 1: Run a single targeted search and batch all read_file / view_file calls in parallel.`,
             ]),
       ].join('\n');
     } else {
@@ -763,11 +1105,11 @@ async function handlePreInvocation(payload) {
           `  * ${f.absFile} (p=${f.prob.toFixed(2)}, git=${f.gitStatus}) [${f.symbols || 'source file'}]`
       );
       directive = [
-        `[JEV SYSTEM-1 EXECUTIVE DECISION PLAN (${res.latencyMs}ms) — OBEY STRICTLY]`,
-        `- Decision: CODEBASE_EDIT (Workspace=${path.basename(workspaceRoot)})${rulesNote}.`,
-        `- STRICT PROHIBITIONS: Do NOT read unrelated SKILL.md or MCP schemas. Batch file reads and edits efficiently using the symbol L<start>-L<end> ranges below.`,
+        `[JEV SYSTEM-1 EXECUTIVE PLAN (${res.latencyMs}ms) — OBEY STRICTLY]`,
+        `- Mode: CODEBASE_EDIT (Workspace=${path.basename(workspaceRoot)}, Verify=${verifyStrategy})${rulesNote}.${clarifyNote}`,
+        `- PROHIBITIONS: Do NOT read unrelated SKILL.md or MCP schemas. Use StartLine/EndLine from the L<start>-L<end> ranges below instead of reading whole files.`,
         ...(fileLines.length > 0
-          ? [`- Jev Pre-Ranked Target Files & Symbol Line Ranges:`, ...fileLines]
+          ? [`- Pre-Ranked Target Files & Symbol Line Ranges:`, ...fileLines]
           : []),
       ].join('\n');
     }
@@ -789,6 +1131,12 @@ async function handlePreInvocation(payload) {
 }
 
 function extractAddedCode(toolName, args) {
+  if (toolName === 'edit_file') {
+    return args?.Replacement || '';
+  }
+  if (toolName === 'write_file') {
+    return args?.Content || '';
+  }
   if (toolName === 'replace_file_content') {
     return args?.ReplacementContent || '';
   }
@@ -814,12 +1162,87 @@ async function handlePreToolUse(payload) {
   const toolName = payload?.toolCall?.name || '';
   const args = payload?.toolCall?.args || {};
 
+  // Token-saving guard for unbounded read_file / view_file on lockfiles or pre-ranked large files
+  if (toolName === 'read_file' || toolName === 'view_file') {
+    const readPath = args?.Path || args?.AbsolutePath || args?.TargetFile || '';
+    const hasLineBounds = args?.StartLine != null || args?.EndLine != null;
+    if (!readPath || hasLineBounds) {
+      return { decision: 'allow' };
+    }
+
+    const base = path.basename(readPath);
+    if (
+      /^(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum|composer\.lock|poetry\.lock)$/.test(
+        base
+      ) ||
+      /\.(pb\.go|g\.dart|freezed\.dart|min\.js)$/.test(base)
+    ) {
+      logTelemetry({
+        hook: 'PreToolUse:read_cap',
+        toolName,
+        targetFile: readPath,
+        reason: 'cap_generated_or_lockfile',
+      });
+      return {
+        decision: 'allow',
+        overwrite: {
+          StartLine: 1,
+          EndLine: 120,
+        },
+      };
+    }
+
+    const sessionState = getSessionState(payload?.conversationId);
+    const rankedMatch = (sessionState?.topFiles || []).find(
+      (f) => f.absFile === readPath || readPath.endsWith(`/${f.file}`)
+    );
+    const alreadySliced = (sessionState?.autoSlicedFiles || []).includes(
+      readPath
+    );
+    if (
+      rankedMatch &&
+      !alreadySliced &&
+      rankedMatch.totalLines > 450 &&
+      rankedMatch.startLine &&
+      rankedMatch.endLine
+    ) {
+      const sliceStart = Math.max(1, rankedMatch.startLine - 25);
+      const sliceEnd = Math.min(
+        rankedMatch.totalLines,
+        Math.max(rankedMatch.endLine + 40, sliceStart + 140)
+      );
+      setSessionState(payload?.conversationId, {
+        ...sessionState,
+        autoSlicedFiles: [...(sessionState?.autoSlicedFiles || []), readPath],
+      });
+      logTelemetry({
+        hook: 'PreToolUse:read_slice',
+        toolName,
+        targetFile: readPath,
+        totalLines: rankedMatch.totalLines,
+        sliceStart,
+        sliceEnd,
+      });
+      return {
+        decision: 'allow',
+        overwrite: {
+          StartLine: sliceStart,
+          EndLine: sliceEnd,
+        },
+      };
+    }
+
+    return { decision: 'allow' };
+  }
+
   if (
     toolName === 'replace_file_content' ||
     toolName === 'multi_replace_file_content' ||
-    toolName === 'write_to_file'
+    toolName === 'write_to_file' ||
+    toolName === 'edit_file' ||
+    toolName === 'write_file'
   ) {
-    const targetFile = args?.TargetFile || '';
+    const targetFile = args?.TargetFile || args?.Path || '';
 
     const sessionState = getSessionState(payload?.conversationId);
     if (
@@ -846,6 +1269,92 @@ async function handlePreToolUse(payload) {
       return { decision: 'allow' };
     }
 
+    // Fast syntactic pre-screening: only ask Jev questions whose triggers exist in addedCode
+    const hasComments = /\/\/|\/\*|^\s*#/m.test(addedCode);
+    const hasElse = /\belse\b/.test(addedCode);
+    const hasGoErrNil = ext === '.go' && /\berr\s*==\s*nil\b/.test(addedCode);
+    const hasGoRawErrorsNew =
+      ext === '.go' && /\berrors\.New\s*\(/.test(addedCode);
+    const hasErrorConstruct =
+      /\b(catch\s*(\(|{)|err\s*(!=|==)\s*nil|_\s*=\s*\w+|except\b|rescue\b)/.test(
+        addedCode
+      );
+
+    const codeQuestions = {};
+    if (hasComments) {
+      codeQuestions.has_narrative_comments = {
+        type: 'noul',
+        instructions:
+          'Does `proposed_code` contain phase-narrating comments such as "// Step 1:", "// Phase 2:", or "// Initialize variables"?',
+        criteria: {
+          true: 'Contains explicit step-by-step or phase-narrating comments',
+          false:
+            'No narrative comments; only doc comments, license headers, or non-obvious constraint notes',
+        },
+      };
+      codeQuestions.has_apology_or_hack_comments = {
+        type: 'noul',
+        instructions:
+          'Does `proposed_code` contain workaround or apology comments such as "// Hack for...", "// Temporary workaround", or "// Do not touch"?',
+        criteria: {
+          true: 'Contains comments apologizing for a hack, race condition workaround, or fragile code',
+          false: 'Clean code or standard technical documentation comments',
+        },
+      };
+    }
+    if (hasElse) {
+      codeQuestions.has_else_after_return = {
+        type: 'noul',
+        instructions:
+          'Does `proposed_code` contain an `else` or `else if` block immediately after an `if` block that unconditionally ends with `return`, `continue`, `break`, or `throw`?',
+        criteria: {
+          true: 'An `if` block terminates unconditionally with return/throw/continue/break and is immediately followed by `else` or `else if`',
+          false:
+            'Uses flat guard clauses without `else` after return, or the `if` branch does not unconditionally return',
+        },
+      };
+    }
+    if (hasGoErrNil) {
+      codeQuestions.has_err_nil_happy_path = {
+        type: 'noul',
+        instructions:
+          'In Go code, does `proposed_code` wrap the happy path inside `if err == nil { ... }` instead of checking `if err != nil` and returning early?',
+        criteria: {
+          true: 'Go code branches on `if err == nil` to execute primary logic',
+          false:
+            'Not Go code, or checks `if err != nil` first as a guard clause',
+        },
+      };
+    }
+    if (hasErrorConstruct) {
+      codeQuestions.swallows_error_silently = {
+        type: 'noul',
+        instructions:
+          'Does `proposed_code` silently swallow an error or exception (e.g., an empty `catch {}` block, `_ = err` on a critical mutation, or logging an error inside an `if err != nil` block and falling through without returning)?',
+        criteria: {
+          true: 'Catches or checks an error and silently ignores it or falls through to downstream mutations without returning/throwing',
+          false:
+            'Properly returns, wraps, or throws errors, or no error handling is present in the snippet',
+        },
+      };
+    }
+    if (hasGoRawErrorsNew) {
+      codeQuestions.uses_raw_errors_new_in_go = {
+        type: 'noul',
+        instructions:
+          'In Go code, does `proposed_code` construct domain or wrapped errors using raw `errors.New(...)` when the repository uses structured `xerrors` (`xerrors.New` / `xerrors.Wrapf`) or typed domain error sentinels?',
+        criteria: {
+          true: 'Go code calls raw `errors.New(...)` for a domain/sentinel error',
+          false:
+            'Not Go code, uses `xerrors`/typed errors, or does not call `errors.New`',
+        },
+      };
+    }
+
+    if (Object.keys(codeQuestions).length === 0) {
+      return { decision: 'allow' };
+    }
+
     try {
       const res = await evaluateSystemOne({
         state: {
@@ -853,67 +1362,7 @@ async function handlePreToolUse(payload) {
           language_extension: ext,
           proposed_code: addedCode.slice(0, 6000),
         },
-        questions: {
-          has_narrative_comments: {
-            type: 'noul',
-            instructions:
-              'Does `proposed_code` contain phase-narrating comments such as "// Step 1:", "// Phase 2:", or "// Initialize variables"?',
-            criteria: {
-              true: 'Contains explicit step-by-step or phase-narrating comments',
-              false:
-                'No narrative comments; only doc comments, license headers, or non-obvious constraint notes',
-            },
-          },
-          has_apology_or_hack_comments: {
-            type: 'noul',
-            instructions:
-              'Does `proposed_code` contain workaround or apology comments such as "// Hack for...", "// Temporary workaround", or "// Do not touch"?',
-            criteria: {
-              true: 'Contains comments apologizing for a hack, race condition workaround, or fragile code',
-              false: 'Clean code or standard technical documentation comments',
-            },
-          },
-          has_else_after_return: {
-            type: 'noul',
-            instructions:
-              'Does `proposed_code` contain an `else` or `else if` block immediately after an `if` block that unconditionally ends with `return`, `continue`, `break`, or `throw`?',
-            criteria: {
-              true: 'An `if` block terminates unconditionally with return/throw/continue/break and is immediately followed by `else` or `else if`',
-              false:
-                'Uses flat guard clauses without `else` after return, or the `if` branch does not unconditionally return',
-            },
-          },
-          has_err_nil_happy_path: {
-            type: 'noul',
-            instructions:
-              'In Go code, does `proposed_code` wrap the happy path inside `if err == nil { ... }` instead of checking `if err != nil` and returning early?',
-            criteria: {
-              true: 'Go code branches on `if err == nil` to execute primary logic',
-              false:
-                'Not Go code, or checks `if err != nil` first as a guard clause',
-            },
-          },
-          swallows_error_silently: {
-            type: 'noul',
-            instructions:
-              'Does `proposed_code` silently swallow an error or exception (e.g., an empty `catch {}` block, `_ = err` on a critical mutation, or logging an error inside an `if err != nil` block and falling through without returning)?',
-            criteria: {
-              true: 'Catches or checks an error and silently ignores it or falls through to downstream mutations without returning/throwing',
-              false:
-                'Properly returns, wraps, or throws errors, or no error handling is present in the snippet',
-            },
-          },
-          uses_raw_errors_new_in_go: {
-            type: 'noul',
-            instructions:
-              'In Go code, does `proposed_code` construct domain or wrapped errors using raw `errors.New(...)` or `fmt.Errorf(...)` when the repository uses structured `xerrors` (`xerrors.New` / `xerrors.Wrapf`)?',
-            criteria: {
-              true: 'Go code calls raw `errors.New(...)` for a domain/sentinel error',
-              false:
-                'Not Go code, uses `xerrors`, or does not call `errors.New`',
-            },
-          },
-        },
+        questions: codeQuestions,
       });
 
       const a = res.answers || {};
@@ -987,8 +1436,75 @@ async function handlePreToolUse(payload) {
     if (!cmd) {
       return { decision: 'allow' };
     }
-    if (isSafeCommand(cmd)) {
+
+    // Fast syntactic pre-screening for shell commands (<1ms for ~90% of dev commands)
+    const hasDestructiveTrigger =
+      /\b(rm\s|rmdir\s|unlink\s|git\s+clean\b|git\s+reset\s+--hard\b|drop\s+(table|database|schema)\b|truncate\s+table\b|terraform\s+destroy\b|kubectl\s+delete\b|docker\s+(rm|system\s+prune)\b|dd\s+if=|mkfs\b)/i.test(
+        cmd
+      );
+    const hasForcePushTrigger =
+      /\bgit\b.*\bpush\b.*(\s--force\b|\s-f\b|\s--force-with-lease\b)/i.test(
+        cmd
+      );
+    const hasOrTrueTrigger = /\|\|\s*(true|:)\b/.test(cmd);
+    const hasSudoTrigger = /(^|[;&|]\s*)sudo\s+/.test(cmd);
+
+    if (
+      !hasDestructiveTrigger &&
+      !hasForcePushTrigger &&
+      !hasOrTrueTrigger &&
+      !hasSudoTrigger
+    ) {
       return { decision: 'allow' };
+    }
+
+    const cmdQuestions = {};
+    if (hasDestructiveTrigger) {
+      cmdQuestions.is_destructive_delete_or_drop = {
+        type: 'noul',
+        instructions:
+          'Does `command_line` recursively delete project/system directories (`rm -rf`), discard uncommitted git work (`git reset --hard`), drop database tables, or destroy cloud infrastructure?',
+        criteria: {
+          true: 'Executes recursive deletion (`rm -rf`), database table/schema drop, or infrastructure destruction',
+          false:
+            'Normal build, test, git, or single temporary file cleanup without destructive directory/data loss',
+        },
+      };
+    }
+    if (hasForcePushTrigger) {
+      cmdQuestions.is_remote_force_push = {
+        type: 'noul',
+        instructions:
+          'Does `command_line` push to a git remote with `--force`, `-f`, or `--force-with-lease`?',
+        criteria: {
+          true: 'Runs `git push` with `--force`, `-f`, or `--force-with-lease`',
+          false: 'Not a git force-push command',
+        },
+      };
+    }
+    if (hasOrTrueTrigger) {
+      cmdQuestions.swallows_test_or_lint_failure = {
+        type: 'noul',
+        instructions:
+          'Does `command_line` run a test suite, build, or linter and suppress its failure exit code using `|| true`?',
+        criteria: {
+          true: 'Runs a test, build, or linter command and appends `|| true` to mask non-zero exit codes',
+          false:
+            'Does not suppress test/build/linter exit codes (or uses `|| true` only on a benign search like `grep`)',
+        },
+      };
+    }
+    if (hasSudoTrigger) {
+      cmdQuestions.uses_sudo_instead_of_pkexec = {
+        type: 'noul',
+        instructions:
+          'Does `command_line` invoke `sudo` to run a privileged command on Linux instead of a polkit/systemd privilege escalation tool such as `pkexec` or `run0`?',
+        criteria: {
+          true: 'Invokes `sudo <command>` for root privileges',
+          false:
+            'Does not invoke `sudo` (e.g. invokes `pkexec`, `run0`, or unprivileged commands)',
+        },
+      };
     }
 
     try {
@@ -997,47 +1513,7 @@ async function handlePreToolUse(payload) {
           command_line: cmd.slice(0, 2000),
           cwd: args?.Cwd || '',
         },
-        questions: {
-          is_destructive_delete_or_drop: {
-            type: 'noul',
-            instructions:
-              'Does `command_line` recursively delete project/system directories (`rm -rf`), drop database tables, or destroy cloud infrastructure?',
-            criteria: {
-              true: 'Executes recursive deletion (`rm -rf`), database table/schema drop, or infrastructure destruction',
-              false:
-                'Normal build, test, git, or file inspection command without destructive deletion',
-            },
-          },
-          is_remote_force_push: {
-            type: 'noul',
-            instructions:
-              'Does `command_line` push to a git remote with `--force`, `-f`, or `--force-with-lease`?',
-            criteria: {
-              true: 'Runs `git push` with `--force`, `-f`, or `--force-with-lease`',
-              false: 'Not a git force-push command',
-            },
-          },
-          swallows_test_or_lint_failure: {
-            type: 'noul',
-            instructions:
-              'Does `command_line` run a test suite, build, or linter and suppress its failure exit code using `|| true`?',
-            criteria: {
-              true: 'Runs a test, build, or linter command and appends `|| true` to mask non-zero exit codes',
-              false:
-                'Does not suppress test/build/linter exit codes (or uses `|| true` only on a benign search like `grep`)',
-            },
-          },
-          uses_sudo_instead_of_pkexec: {
-            type: 'noul',
-            instructions:
-              'Does `command_line` invoke `sudo` to run a privileged command on Linux instead of a polkit/systemd privilege escalation tool such as `pkexec` or `run0`?',
-            criteria: {
-              true: 'Invokes `sudo <command>` for root privileges',
-              false:
-                'Does not invoke `sudo` (e.g. invokes `pkexec`, `run0`, or unprivileged commands)',
-            },
-          },
-        },
+        questions: cmdQuestions,
       });
 
       const a = res.answers || {};
@@ -1067,7 +1543,7 @@ async function handlePreToolUse(payload) {
       }
 
       if (swallowsFailure >= 0.92) {
-        const sanitizedCmd = cmd.replace(/\s*\|\|\s*true\s*$/, '').trim();
+        const sanitizedCmd = cmd.replace(/\s*\|\|\s*(true|:)\s*$/, '').trim();
         if (sanitizedCmd && sanitizedCmd !== cmd) {
           logTelemetry({
             hook: 'PreToolUse:command:overwrite',
@@ -1120,10 +1596,16 @@ async function handlePreToolUse(payload) {
 
 function isDuplicateStep(mode, payload) {
   const convId = payload?.conversationId || '';
+  const args = payload?.toolCall?.args || {};
+  const targetDiscriminator =
+    args?.TargetFile ||
+    args?.Path ||
+    (args?.CommandLine || '').slice(0, 60) ||
+    '';
   const stepKey =
     mode === 'PreInvocation'
       ? `inv:${payload?.invocationNum ?? ''}:${payload?.initialNumSteps ?? ''}`
-      : `step:${payload?.stepIdx ?? ''}:${payload?.toolCall?.name ?? ''}`;
+      : `step:${payload?.stepIdx ?? ''}:${payload?.toolCall?.name ?? ''}:${targetDiscriminator}`;
   if (!convId || stepKey.endsWith('::')) {
     return false;
   }

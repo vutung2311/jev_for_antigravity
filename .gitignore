@@ -2,4 +2,6 @@
 .env.*
 node_modules/
 *.log
+logs/
+*.jsonl
 .DS_Store
