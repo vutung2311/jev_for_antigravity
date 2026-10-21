@@ -7,12 +7,51 @@ A 100% repository-agnostic **System One Executive Decision Engine (`PreInvocatio
 ## Quick Start & Installation
 
 ### Prerequisites
-- **Node.js** `>= 18`
-- **ripgrep** (`rg`)
-- **git**
-- A TypeSafe API key (`TYPESAFE_API_KEY`)
 
-### 1-Command Install
+| Tool | Windows (winget) | Linux / macOS | Notes |
+| :--- | :--- | :--- | :--- |
+| **Node.js** `>= 18` | `winget install OpenJS.NodeJS.LTS` | `nvm install 20` or apt/brew | Required runtime for hook engine |
+| **ripgrep** (`rg`) | `winget install BurntSushi.ripgrep.MSVC` | `brew install ripgrep` or apt | Auto-detected from Antigravity IDE if already installed |
+| **git** | `winget install Git.Git` | built-in or `brew install git` | Required for dirty state & symbol discovery |
+| **TypeSafe API Key** | `TYPESAFE_API_KEY` | `TYPESAFE_API_KEY` | From [api.typesafe.ai](https://api.typesafe.ai) |
+
+---
+
+### Windows (PowerShell / Command Prompt / Git Bash)
+
+Clone the repository:
+```powershell
+git clone https://github.com/vutung2311/jev_for_antigravity.git
+cd jev_for_antigravity
+```
+
+#### 1-Command Install (PowerShell)
+```powershell
+# Install and persist your TypeSafe API key (User environment + jev.env):
+.\install.ps1 -ApiKey "your_typesafe_api_key_here"
+
+# Or if TYPESAFE_API_KEY is already set in your environment:
+.\install.ps1
+```
+
+#### 1-Command Install (Command Prompt / Batch)
+```cmd
+install.bat --api-key "your_typesafe_api_key_here"
+```
+
+#### Verify / Uninstall (Windows)
+```powershell
+# Verify installation & Jev hook health check:
+.\install.ps1 -Check
+
+# Uninstall cleanly:
+.\install.ps1 -Uninstall
+```
+
+---
+
+### Linux & macOS (Bash / Zsh)
+
 ```bash
 git clone https://github.com/vutung2311/jev_for_antigravity.git
 cd jev_for_antigravity
@@ -22,11 +61,8 @@ cd jev_for_antigravity
 
 # Or if TYPESAFE_API_KEY is already exported in your environment:
 ./install.sh
-```
 
-### Verify / Uninstall
-```bash
-# Verify installation & live Jev API response:
+# Verify:
 ./install.sh --check
 
 # Uninstall cleanly:

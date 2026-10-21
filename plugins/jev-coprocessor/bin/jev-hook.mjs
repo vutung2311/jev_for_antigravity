@@ -33,6 +33,9 @@ function getPrivilegeEscalationTool() {
   if (process.env.PRIVILEGE_ESCALATION) {
     return process.env.PRIVILEGE_ESCALATION;
   }
+  if (process.platform === 'win32') {
+    return 'sudo';
+  }
   if (!fs.existsSync('/proc/self/status')) {
     return 'pkexec';
   }
@@ -45,6 +48,33 @@ function getPrivilegeEscalationTool() {
   } catch {
     return 'pkexec';
   }
+}
+
+function resolveRgExecutable() {
+  if (process.env.RG_PATH) {
+    return process.env.RG_PATH;
+  }
+  try {
+    const probe = spawnSync('rg', ['--version'], { encoding: 'utf8', timeout: 300 });
+    if (probe.status === 0) {
+      return 'rg';
+    }
+  } catch {}
+
+  if (process.platform === 'win32') {
+    const home = process.env.USERPROFILE || os.homedir();
+    const candidates = [
+      path.join(home, 'AppData', 'Local', 'Programs', 'Antigravity IDE', 'resources', 'app', 'node_modules', '@vscode', 'ripgrep', 'bin', 'rg.exe'),
+      path.join(home, 'AppData', 'Local', 'Programs', 'Microsoft VS Code', 'resources', 'app', 'node_modules', '@vscode', 'ripgrep', 'bin', 'rg.exe'),
+      'C:\\Program Files\\ripgrep\\rg.exe',
+    ];
+    for (const cand of candidates) {
+      if (fs.existsSync(cand)) {
+        return cand;
+      }
+    }
+  }
+  return 'rg';
 }
 
 const STOPWORDS = new Set([
@@ -210,7 +240,7 @@ function extractTranscriptContext(payload, workspaceRoot) {
               if (
                 fPath &&
                 typeof fPath === 'string' &&
-                !fPath.includes('/brain/') &&
+                !/[/\\]brain[/\\]/.test(fPath) &&
                 fs.existsSync(fPath)
               ) {
                 recentFileSet.add(fPath);
@@ -372,18 +402,21 @@ function extractPrioritizedKeywords(userMessage, recentContextSummary = '') {
 function extractDirectoryHints(userMessage, workspaceRoot, secondaryRoots = []) {
   const hints = [];
   const roots = [workspaceRoot, ...secondaryRoots].filter(Boolean);
-  const absPaths =
+  const winAbsPaths =
+    userMessage.match(/[a-zA-Z]:[/\\][a-zA-Z0-9_.-]+(?:[/\\][a-zA-Z0-9_.-]+)+/g) || [];
+  const unixAbsPaths =
     userMessage.match(/\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+/g) || [];
+  const absPaths = [...winAbsPaths, ...unixAbsPaths];
   for (const rawAbs of absPaths) {
     const cleanAbs = rawAbs.replace(/[.,:;!?)]+$/, '');
-    if (fs.existsSync(cleanAbs) && !cleanAbs.includes('/brain/')) {
+    if (fs.existsSync(cleanAbs) && !/[/\\]brain[/\\]/.test(cleanAbs)) {
       const stat = fs.statSync(cleanAbs);
       hints.push(stat.isDirectory() ? cleanAbs : path.dirname(cleanAbs));
     }
   }
 
   const pathTokens =
-    userMessage.match(/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+/g) || [];
+    userMessage.match(/[a-zA-Z0-9_.-]+(?:[/\\][a-zA-Z0-9_.-]+)+/g) || [];
   for (const rawToken of pathTokens) {
     const cleanToken = rawToken.replace(/[.,:;!?)]+$/, '');
     for (const root of roots) {
@@ -626,7 +659,7 @@ function findCandidateFilesWithSummaries(
         .join('|');
 
       const rgRes = spawnSync(
-        'rg',
+        resolveRgExecutable(),
         [
           '-i',
           '-c',
@@ -1248,7 +1281,7 @@ async function handlePreToolUse(payload) {
     if (
       sessionState?.readOnlyQuestionTurn &&
       targetFile &&
-      !targetFile.includes('/brain/')
+      !/[/\\]brain[/\\]/.test(targetFile)
     ) {
       logTelemetry({
         hook: 'PreToolUse:question_first_lock',
@@ -1609,7 +1642,7 @@ function isDuplicateStep(mode, payload) {
   if (!convId || stepKey.endsWith('::')) {
     return false;
   }
-  const dedupPath = `/tmp/jev-hook-last-step-${convId}.json`;
+  const dedupPath = path.join(os.tmpdir(), `jev-hook-last-step-${convId}.json`);
   const composite = `${convId}|${mode}|${stepKey}`;
   try {
     if (fs.existsSync(dedupPath)) {

@@ -54,8 +54,11 @@ function loadEnv() {
 
   if (!config.apiKey) {
     for (const candidate of [
+      path.join(HOME_DIR, '.gemini', 'config', 'jev.env'),
+      path.join(HOME_DIR, '.gemini', 'config', '.env'),
       path.join(HOME_DIR, '.zshenv'),
       path.join(HOME_DIR, '.profile'),
+      path.join(HOME_DIR, '.env'),
       ENV_PATH,
     ]) {
       parseEnvFile(candidate, config);
