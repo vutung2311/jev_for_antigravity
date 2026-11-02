@@ -4,33 +4,37 @@ Integrates TypeSafe's **Jev** (`jev-latest`, System One model) into Antigravity 
 
 ## Architecture (100% Repository-Agnostic)
 
-1. **`PreInvocation` — Executive Decision Engine (~370ms cold / <5ms cached)**:
-   - Evaluates the incoming user prompt, recent `transcript.jsonl` conversation context, and subagent initial messages in a single batched `POST https://api.typesafe.ai/v1/systemone` request using `Choice` and `Noul` primitives (`execution_mode`, `is_self_contained_spec`, `is_investigatory_question_only`, `is_underspecified_or_ambiguous`, `verification_strategy`, and candidate file probabilities).
-   - Dynamically discovers candidate files in **any** repository by combining `git status --porcelain` (dirty/modified/untracked files), recently read/edited files from `transcript.jsonl`, secondary git worktree roots, and identifier-prioritized `rg` searches across 21+ source languages.
-   - Extracts and ranks top symbols by full-body keyword relevance (`[hits: L<line>]`) with exact `L<start>-L<end>` line ranges and matching code snippets (`match_preview`) so the planner can call `read_file` / `view_file` with `StartLine`/`EndLine` slices in a single parallel Turn 1 batch.
-   - Prevents Turn-2+ amnesia and search loops by persisting the session plan and injecting zero-API-cost Turn-2 reminders and Turn-4+ **Convergence Guards** when the agent runs consecutive search turns.
+1. **`PreInvocation` — Executive Decision Engine (~215ms warm / <2ms cached)**:
+   - Evaluates the incoming user prompt (merging queued/continuation follow-up fragments), $O(1)$ tail-read `transcript.jsonl` context across parallel tool turns, and subagent initial messages in a single batched `POST https://api.typesafe.ai/v1/systemone` request using `Choice` and `Noul` primitives.
+   - Concurrently runs `git status --porcelain` and identifier-prioritized `rg` searches across 21+ source languages, filtering generated files (`*.pb.go`, `*.bob.go`, `*.sql.go`, `*_gen.go`, `*.gen.ts`, `*.g.dart`) while conditionally including test files when test/assertion terms appear in the prompt.
+   - Extracts and ranks top symbols by full-body keyword relevance (`[hits: L<line>]`) with exact `L<start>-L<end>` line ranges and matching code snippets (`match_preview`).
+   - Prevents Turn-2+ amnesia and unbatched serial search loops with zero-API-cost Turn-2 reminders and rate-limited **Convergence Guards**.
    - Persists a **Question-First Read-Only Lock** (`/tmp/jev-session-<conversationId>.json`) when `execution_mode === "codebase_audit_or_answer"` and `is_investigatory_question_only >= 0.88`.
 
-2. **`PreToolUse` — Synchronous Code, Read, & Command Guardrail (<1ms local pre-screen / ~370ms Jev)**:
-   - **Auto-Slicing & Lockfile Capping (`read_file`, `view_file`)**: Automatically caps unbounded reads of lockfiles/generated code to `L1-L120` and auto-slices first-time unbounded reads of large (`>450` line) Jev-ranked files to their primary matched symbol range via `overwrite: { StartLine, EndLine }`.
-   - **Question-First Lock Enforcement**: Blocks unrequested file edits (`decision: "deny"`) during investigatory/explanatory question turns until the user asks to apply changes.
-   - **Syntactically Pre-Screened Code Edit Gate (`edit_file`, `write_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`)**: Pre-screens diffs locally in `<1ms` and queries Jev only for active syntactic triggers (`has_narrative_comments`, `has_apology_or_hack_comments`, `has_else_after_return`, `has_err_nil_happy_path`, `swallows_error_silently`, `uses_raw_errors_new_in_go`), blocking (`decision: "deny"`) violations before disk write.
+2. **`PreToolUse` — Synchronous Code, Read, & Command Guardrail (<1ms local pre-screen / ~215ms warm Jev)**:
+   - **Auto-Slicing & Generated/Lockfile Capping (`read_file`, `view_file`)**: Caps unbounded or wide reads of lockfiles/generated code to `L1-L120` and auto-slices first-time wide/unbounded reads of large (`>450` line) Jev-ranked files across both `Path` and Antigravity IDE `AbsolutePath`.
+   - **Question-First Lock Enforcement**: Blocks unrequested file edits (`decision: "deny"`) during investigatory/explanatory question turns.
+   - **Precision-Screened Code Edit Gate (`edit_file`, `write_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`)**: Pre-screens diffs locally in `<1ms` (ignoring URLs inside strings, standard doc headers, and `errors.New` in unit tests) and blocks violations before disk write.
    - **Shell Command Gate & Zero-Turn Auto-Sanitization (`run_command`)**:
-     - Fast-allows commands with zero risk tokens in `<1ms` (eliminating ~90% of redundant API calls).
-     - Escalates destructive deletes (`rm -rf`, `git reset --hard`, schema drops) and remote force-pushes (`git push --force`) to `decision: "force_ask"`.
-     - Uses `PreToolUse` `overwrite: { CommandLine: ... }` to **auto-sanitize** trailing `|| true` on test/build/linter commands and dynamically rewrite `sudo <cmd>` to `pkexec <cmd>` (or `run0 <cmd>` when `NoNewPrivs=1` is detected) in-place without burning an extra LLM retry turn.
+     - Fast-allows commands with zero risk tokens in `<1ms`.
+     - Escalates destructive deletes and remote force-pushes to `decision: "force_ask"`.
+     - Auto-sanitizes trailing `|| true` on test/build/linter commands and rewrites `sudo <cmd>` to `pkexec <cmd>` (or `run0 <cmd>` when `NoNewPrivs=1` is detected) via `overwrite: { CommandLine }`.
 
-3. **Content-Addressed 60s Response Cache (`/tmp/jev-response-cache.json`)**:
-   - Hashes `{ model, state, questions }` with SHA-256 and serves identical evaluations within 60 seconds in `<5ms` with zero API cost.
+3. **Keep-Alive Local Co-Processor Daemon & 5m LRU/Atomic Cache (`jev-daemon.mjs`)**:
+   - Maintains a pre-warmed HTTPS Keep-Alive pool over Unix socket / Windows Named Pipe (**~215ms warm vs ~470ms cold**), in-flight SHA-256 request coalescing, 5 MB telemetry log rotation, and a 5-minute in-memory + atomic disk response cache (`<1ms` hits).
 
 ## Setup
 
-1. Export `TYPESAFE_API_KEY` in your shell environment (e.g., `~/.zshenv` or `~/.profile`):
+1. Export `TYPESAFE_API_KEY` or pass `--api-key` to the installer:
    ```sh
-   export TYPESAFE_API_KEY="your_typesafe_api_key_here"
+   ./install.sh --api-key "your_typesafe_api_key_here"
+   ```
+   On Windows PowerShell:
+   ```powershell
+   .\install.ps1 -ApiKey "your_typesafe_api_key_here"
    ```
    *(Optional overrides: `TYPESAFE_MODEL=jev-latest`, `TYPESAFE_API_URL=https://api.typesafe.ai/v1/systemone`)*
-2. Run `./deploy.sh --non-system` from `local_diagnostic` to sync `hooks.json` and plugin scripts to `~/.gemini/config/`, `~/.gemini/antigravity/`, and `~/.gemini/antigravity-ide/`.
+2. Verify installation and warm daemon health with `./install.sh --check` (or `.\install.ps1 -Check` on Windows).
 
 ## Empirical 4-Way Benchmark Results (Task 1 Audit + Task 2 Go Coding)
 

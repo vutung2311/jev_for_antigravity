@@ -1,18 +1,38 @@
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DAEMON_SCRIPT = path.join(__dirname, 'jev-daemon.mjs');
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const ENV_PATH = path.join(PLUGIN_ROOT, '.env');
 const LOG_DIR = path.join(PLUGIN_ROOT, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'jev-telemetry.jsonl');
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const CACHE_FILE = path.join(os.tmpdir(), 'jev-response-cache.json');
-const CACHE_TTL_MS = 60_000;
+export const CACHE_TTL_MS = 300_000;
 
 const HOME_DIR = process.env.HOME || os.homedir();
+let logDirInitialized = false;
+
+function resolveDaemonSocketPath() {
+  if (process.platform === 'win32') {
+    const rawUser = process.env.USERNAME || os.userInfo().username || 'default';
+    const safeUser = rawUser.replace(/[^a-zA-Z0-9_-]/g, '_');
+    return `\\\\.\\pipe\\jev-coprocessor-v2-${safeUser}`;
+  }
+  const uid =
+    typeof process.getuid === 'function'
+      ? process.getuid()
+      : (os.userInfo().username || 'default').replace(/[^a-zA-Z0-9_-]/g, '_');
+  return path.join(os.tmpdir(), `jev-coprocessor-v2-${uid}.sock`);
+}
+
+export const DAEMON_SOCKET_PATH = resolveDaemonSocketPath();
 
 function parseEnvFile(filePath, target) {
   if (!fs.existsSync(filePath)) {
@@ -45,7 +65,7 @@ function parseEnvFile(filePath, target) {
   }
 }
 
-function loadEnv() {
+export function loadEnv() {
   const config = {
     apiKey: process.env.TYPESAFE_API_KEY || process.env.JEV_API_KEY || '',
     model: process.env.TYPESAFE_MODEL || process.env.JEV_MODEL || '',
@@ -75,20 +95,34 @@ function loadEnv() {
   };
 }
 
+export function computeCacheKey(reqBody) {
+  return crypto.createHash('sha256').update(reqBody).digest('hex');
+}
+
 export function logTelemetry(entry) {
+  if (!entry || !entry.hook) {
+    return false;
+  }
   try {
-    fs.mkdirSync(LOG_DIR, { recursive: true });
+    if (!logDirInitialized) {
+      fs.mkdirSync(LOG_DIR, { recursive: true });
+      logDirInitialized = true;
+    }
+    if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size >= MAX_LOG_BYTES) {
+      fs.renameSync(LOG_FILE, `${LOG_FILE}.1`);
+    }
     const record = JSON.stringify({
       timestamp: new Date().toISOString(),
       ...entry,
     });
     fs.appendFileSync(LOG_FILE, record + '\n', 'utf8');
+    return true;
   } catch {
-    // Non-blocking telemetry write
+    return false;
   }
 }
 
-function readCachedResponse(cacheKey) {
+export function readCachedResponse(cacheKey) {
   try {
     if (!fs.existsSync(CACHE_FILE)) {
       return null;
@@ -98,13 +132,13 @@ function readCachedResponse(cacheKey) {
     if (entry && Date.now() - entry.ts < CACHE_TTL_MS) {
       return entry.data;
     }
+    return null;
   } catch {
-    // ignore cache read errors
+    return null;
   }
-  return null;
 }
 
-function writeCachedResponse(cacheKey, data) {
+export function writeCachedResponse(cacheKey, data) {
   try {
     let store = {};
     if (fs.existsSync(CACHE_FILE)) {
@@ -117,13 +151,78 @@ function writeCachedResponse(cacheKey, data) {
       }
     }
     store[cacheKey] = { ts: now, data };
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(store), 'utf8');
+    const tmpFile = `${CACHE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(store), 'utf8');
+    fs.renameSync(tmpFile, CACHE_FILE);
+    return true;
   } catch {
-    // ignore cache write errors
+    return false;
   }
 }
 
-export async function evaluateSystemOne({ state, questions, model, timeoutMs = 4500 }) {
+function spawnDaemonDetached() {
+  if (process.env.JEV_NO_DAEMON === '1' || !fs.existsSync(DAEMON_SCRIPT)) {
+    return;
+  }
+  try {
+    const child = spawn(process.execPath, [DAEMON_SCRIPT], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+  } catch (err) {
+    void err;
+  }
+}
+
+function requestViaDaemon(payloadObj, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payloadObj);
+    const req = http.request(
+      {
+        socketPath: DAEMON_SOCKET_PATH,
+        path: '/evaluate',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          if (res.statusCode !== 200) {
+            reject(new Error(`Daemon HTTP ${res.statusCode}: ${raw}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(raw));
+          } catch (parseErr) {
+            reject(parseErr);
+          }
+        });
+      }
+    );
+    req.on('timeout', () => {
+      req.destroy(new Error('Daemon request timed out'));
+    });
+    req.on('error', (err) => {
+      reject(err);
+    });
+    req.end(body);
+  });
+}
+
+export async function directEvaluateSystemOne({
+  state,
+  questions,
+  model,
+  timeoutMs = 4500,
+}) {
   const cfg = loadEnv();
   if (!cfg.apiKey) {
     throw new Error('Missing TYPESAFE_API_KEY in environment or plugin .env');
@@ -134,7 +233,7 @@ export async function evaluateSystemOne({ state, questions, model, timeoutMs = 4
     model: model || cfg.model,
     questions,
   });
-  const cacheKey = crypto.createHash('sha256').update(reqBody).digest('hex');
+  const cacheKey = computeCacheKey(reqBody);
   const cached = readCachedResponse(cacheKey);
   if (cached) {
     return {
@@ -173,4 +272,23 @@ export async function evaluateSystemOne({ state, questions, model, timeoutMs = 4
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function evaluateSystemOne({
+  state,
+  questions,
+  model,
+  timeoutMs = 4500,
+}) {
+  if (process.env.JEV_NO_DAEMON !== '1') {
+    try {
+      return await requestViaDaemon({ state, questions, model, timeoutMs }, timeoutMs);
+    } catch (daemonErr) {
+      const code = daemonErr?.code || '';
+      if (code === 'ENOENT' || code === 'ECONNREFUSED' || code === 'EPIPE') {
+        spawnDaemonDetached();
+      }
+    }
+  }
+  return directEvaluateSystemOne({ state, questions, model, timeoutMs });
 }

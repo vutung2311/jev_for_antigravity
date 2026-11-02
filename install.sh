@@ -177,17 +177,57 @@ fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 ' "$cfg_file" "$1"
 }
 
+prune_global_jev_hooks() {
+    local hook_file="$1"
+    if [[ -L "$hook_file" ]]; then
+        if [[ ! -e "$hook_file" ]]; then
+            rm -f "$hook_file"
+        fi
+        return 0
+    fi
+    if [[ ! -f "$hook_file" ]]; then
+        return 0
+    fi
+    node -e '
+const fs = require("node:fs");
+const file = process.argv[1];
+try {
+  const data = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete data["jev-intent-router"];
+  delete data["jev-tool-guardrail"];
+  if (Object.keys(data).length === 0) {
+    fs.unlinkSync(file);
+  } else {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n", "utf8");
+  }
+} catch {
+  // preserve malformed user file untouched
+}
+' "$hook_file"
+}
+
+stop_jev_daemon() {
+    pkill -f "jev-daemon\.mjs" 2>/dev/null || true
+    rm -f /tmp/jev-coprocessor-*.sock 2>/dev/null || true
+}
+
+cleanup_legacy_mcp_schemas() {
+    for agy_dir in "${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide"; do
+        rm -rf "${agy_dir}/mcp/jev-coprocessor-mcp" "${agy_dir}/mcp/jev-coprocessor_jev-coprocessor-mcp" 2>/dev/null || true
+    done
+}
+
 run_smoke_check() {
     echo -e "${CYAN}Running Jev Co-Processor health check...${NC}"
-    if [[ ! -f "${PLUGIN_DEST}/bin/jev-hook.mjs" ]]; then
-        echo -e "  ${RED}✗ Plugin not installed at ${PLUGIN_DEST}${NC}" >&2
+    if [[ ! -f "${PLUGIN_DEST}/bin/jev-hook.mjs" || ! -f "${PLUGIN_DEST}/bin/jev-daemon.mjs" ]]; then
+        echo -e "  ${RED}✗ Plugin scripts incomplete at ${PLUGIN_DEST}${NC}" >&2
         exit 1
     fi
-    echo -e "  ${GREEN}✓ Plugin scripts present at ${PLUGIN_DEST}${NC}"
+    echo -e "  ${GREEN}✓ Plugin & warm daemon scripts present at ${PLUGIN_DEST}${NC}"
 
     for agy_dir in "${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide"; do
         if [[ -d "$agy_dir" ]]; then
-            if [[ -f "${agy_dir}/hooks.json" && -d "${agy_dir}/plugins/jev-coprocessor" ]]; then
+            if [[ -d "${agy_dir}/plugins/jev-coprocessor" && -f "${PLUGIN_DEST}/hooks.json" ]]; then
                 echo -e "  ${GREEN}✓ Integrated into ${agy_dir}${NC}"
             else
                 echo -e "  ${YELLOW}! Missing integration in ${agy_dir} (run ./install.sh to repair)${NC}"
@@ -216,6 +256,8 @@ install_plugin() {
         configure_api_key "$API_KEY_ARG"
     fi
 
+    stop_jev_daemon
+    cleanup_legacy_mcp_schemas
     mkdir -p "${PLUGIN_DEST}/bin" "${PLUGIN_DEST}/assets"
 
     if [[ "$IS_WINDOWS" == "true" ]]; then
@@ -236,36 +278,37 @@ const hooks = {
   }
 };
 fs.writeFileSync(process.argv[1], JSON.stringify(hooks, null, 2) + "\n", "utf8");
-' "${CONFIG_DIR}/hooks.json"
-        cp -f "${CONFIG_DIR}/hooks.json" "${PLUGIN_DEST}/hooks.json"
+' "${PLUGIN_DEST}/hooks.json"
     else
-        cp -f "${SCRIPT_DIR}/hooks.json" "${CONFIG_DIR}/hooks.json"
         cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/hooks.json" "${PLUGIN_DEST}/hooks.json"
     fi
+
+    prune_global_jev_hooks "${CONFIG_DIR}/hooks.json"
 
     cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/plugin.json" "${PLUGIN_DEST}/plugin.json"
     cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/README.md" "${PLUGIN_DEST}/README.md"
     cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/assets/logo.svg" "${PLUGIN_DEST}/assets/logo.svg"
     cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-client.mjs" "${PLUGIN_DEST}/bin/jev-client.mjs"
+    cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-daemon.mjs" "${PLUGIN_DEST}/bin/jev-daemon.mjs"
     cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-hook.mjs" "${PLUGIN_DEST}/bin/jev-hook.mjs"
-    chmod +x "${PLUGIN_DEST}/bin/jev-client.mjs" "${PLUGIN_DEST}/bin/jev-hook.mjs" 2>/dev/null || true
+    chmod +x "${PLUGIN_DEST}/bin/jev-client.mjs" "${PLUGIN_DEST}/bin/jev-daemon.mjs" "${PLUGIN_DEST}/bin/jev-hook.mjs" 2>/dev/null || true
     if [[ -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-hook.cmd" ]]; then
         cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-hook.cmd" "${PLUGIN_DEST}/bin/jev-hook.cmd"
     fi
 
     enable_plugin_in_config "true"
-    echo -e "  ${GREEN}✓ Installed plugin and hooks to ${CONFIG_DIR}${NC}"
+    echo -e "  ${GREEN}✓ Installed plugin and hooks to ${PLUGIN_DEST}${NC}"
 
     for agy_dir in "${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide"; do
         mkdir -p "${agy_dir}/plugins"
-        cp -f "${CONFIG_DIR}/hooks.json" "${agy_dir}/hooks.json"
+        prune_global_jev_hooks "${agy_dir}/hooks.json"
         if [[ "$IS_WINDOWS" == "true" ]]; then
             rm -rf "${agy_dir}/plugins/jev-coprocessor" 2>/dev/null || true
             cp -rf "${PLUGIN_DEST}" "${agy_dir}/plugins/jev-coprocessor"
         else
             ln -sfn "${PLUGIN_DEST}" "${agy_dir}/plugins/jev-coprocessor"
         fi
-        echo -e "  ${GREEN}✓ Integrated hooks and plugin into ${agy_dir}${NC}"
+        echo -e "  ${GREEN}✓ Integrated plugin into ${agy_dir}${NC}"
     done
 
     echo ""
@@ -276,10 +319,13 @@ fs.writeFileSync(process.argv[1], JSON.stringify(hooks, null, 2) + "\n", "utf8")
 
 uninstall_plugin() {
     echo -e "${CYAN}Uninstalling Jev System One Co-Processor...${NC}"
+    stop_jev_daemon
+    cleanup_legacy_mcp_schemas
     for agy_dir in "${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide"; do
-        rm -rf "${agy_dir}/hooks.json" "${agy_dir}/plugins/jev-coprocessor"
+        prune_global_jev_hooks "${agy_dir}/hooks.json"
+        rm -rf "${agy_dir}/plugins/jev-coprocessor"
     done
-    rm -f "${CONFIG_DIR}/hooks.json"
+    prune_global_jev_hooks "${CONFIG_DIR}/hooks.json"
     rm -rf "${PLUGIN_DEST}"
     enable_plugin_in_config "false"
     echo -e "${GREEN}✓ Uninstalled Jev Co-Processor from Antigravity.${NC}"

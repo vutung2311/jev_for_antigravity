@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { evaluateSystemOne, logTelemetry } from './jev-client.mjs';
 
 const CODE_EXTENSIONS = new Set([
@@ -50,31 +50,96 @@ function getPrivilegeEscalationTool() {
   }
 }
 
-function resolveRgExecutable() {
-  if (process.env.RG_PATH) {
-    return process.env.RG_PATH;
-  }
-  try {
-    const probe = spawnSync('rg', ['--version'], { encoding: 'utf8', timeout: 300 });
-    if (probe.status === 0) {
-      return 'rg';
-    }
-  } catch {}
+let cachedRgExecutable = null;
 
-  if (process.platform === 'win32') {
-    const home = process.env.USERPROFILE || os.homedir();
-    const candidates = [
-      path.join(home, 'AppData', 'Local', 'Programs', 'Antigravity IDE', 'resources', 'app', 'node_modules', '@vscode', 'ripgrep', 'bin', 'rg.exe'),
-      path.join(home, 'AppData', 'Local', 'Programs', 'Microsoft VS Code', 'resources', 'app', 'node_modules', '@vscode', 'ripgrep', 'bin', 'rg.exe'),
-      'C:\\Program Files\\ripgrep\\rg.exe',
-    ];
-    for (const cand of candidates) {
-      if (fs.existsSync(cand)) {
-        return cand;
-      }
+function resolveWindowsRgFallback() {
+  const home = process.env.USERPROFILE || os.homedir();
+  const candidates = [
+    path.join(
+      home,
+      'AppData',
+      'Local',
+      'Programs',
+      'Antigravity IDE',
+      'resources',
+      'app',
+      'node_modules',
+      '@vscode',
+      'ripgrep',
+      'bin',
+      'rg.exe'
+    ),
+    path.join(
+      home,
+      'AppData',
+      'Local',
+      'Programs',
+      'Microsoft VS Code',
+      'resources',
+      'app',
+      'node_modules',
+      '@vscode',
+      'ripgrep',
+      'bin',
+      'rg.exe'
+    ),
+    'C:\\Program Files\\ripgrep\\rg.exe',
+  ];
+  for (const cand of candidates) {
+    if (fs.existsSync(cand)) {
+      return cand;
     }
   }
   return 'rg';
+}
+
+function resolveRgExecutable() {
+  if (cachedRgExecutable) {
+    return cachedRgExecutable;
+  }
+  if (process.env.RG_PATH) {
+    cachedRgExecutable = process.env.RG_PATH;
+    return cachedRgExecutable;
+  }
+  cachedRgExecutable = 'rg';
+  return cachedRgExecutable;
+}
+
+function runProcessAsync(bin, args, timeoutMs = 300) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (stdout, code, errCode = '') => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({ stdout, status: code, errCode });
+    };
+    let child;
+    try {
+      child = spawn(bin, args, {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      });
+    } catch (err) {
+      finish('', -1, err?.code || 'SPAWN_ERR');
+      return;
+    }
+    const chunks = [];
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(Buffer.concat(chunks).toString('utf8'), -1, 'ETIMEDOUT');
+    }, timeoutMs);
+    child.stdout.on('data', (c) => chunks.push(c));
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      finish('', -1, err?.code || 'ERR');
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      finish(Buffer.concat(chunks).toString('utf8'), code ?? 0, '');
+    });
+  });
 }
 
 const STOPWORDS = new Set([
@@ -200,6 +265,58 @@ function cleanPromptText(text) {
     .trim();
 }
 
+const TRANSCRIPT_TAIL_BYTES = 98_304;
+const GENERATED_FILE_REGEX =
+  /(?:^|[/\\])(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum|composer\.lock|poetry\.lock)$|\.(?:pb\.go|bob\.go|sql\.go|gen\.go|gen\.ts|generated\.ts|g\.dart|freezed\.dart|min\.js)$|(?:_gen\.go|^mock_.*\.go)$/i;
+
+function readTranscriptTailLines(transcriptPath) {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) {
+    return [];
+  }
+  let fd = -1;
+  try {
+    fd = fs.openSync(transcriptPath, 'r');
+    const size = fs.fstatSync(fd).size;
+    if (size === 0) {
+      return [];
+    }
+    const readLen = Math.min(size, TRANSCRIPT_TAIL_BYTES);
+    const offset = size - readLen;
+    const buf = Buffer.allocUnsafe(readLen);
+    const bytesRead = fs.readSync(fd, buf, 0, readLen, offset);
+    let text = buf.subarray(0, bytesRead).toString('utf8');
+    if (offset > 0) {
+      const firstNewline = text.indexOf('\n');
+      if (firstNewline !== -1) {
+        text = text.slice(firstNewline + 1);
+      }
+    }
+    return text.trim().split(/\r?\n/).filter(Boolean);
+  } catch {
+    return [];
+  } finally {
+    if (fd !== -1) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // closed
+      }
+    }
+  }
+}
+
+function isContinuationFragment(text) {
+  if (!text) {
+    return false;
+  }
+  if (text.length < 48) {
+    return true;
+  }
+  return /^(and|also|plus|or|but|as\s+well|what\s+about|how\s+about|for\s+the)\b/i.test(
+    text.trim()
+  );
+}
+
 function extractTranscriptContext(payload, workspaceRoot) {
   const ctx = {
     latestUserInput: null,
@@ -208,6 +325,7 @@ function extractTranscriptContext(payload, workspaceRoot) {
     recentFiles: [],
     secondaryRoots: [],
     recentContextSummary: '',
+    transcriptSize: 0,
   };
 
   const recentFileSet = new Set();
@@ -216,109 +334,147 @@ function extractTranscriptContext(payload, workspaceRoot) {
 
   if (transcriptPath && fs.existsSync(transcriptPath)) {
     try {
-      const content = fs.readFileSync(transcriptPath, 'utf8').trim();
-      if (content) {
-        const lines = content.split(/\r?\n/);
-        const startIdx = Math.max(0, lines.length - 24);
-        let foundLatestUser = false;
-        let streakSearching = true;
+      ctx.transcriptSize = fs.statSync(transcriptPath).size;
+    } catch {
+      ctx.transcriptSize = 0;
+    }
+    const lines = readTranscriptTailLines(transcriptPath);
+    if (lines.length > 0) {
+      const startIdx = Math.max(0, lines.length - 160);
+      let foundLatestUser = false;
+      let streakSearching = true;
+      let plannerTurnsSeen = 0;
+      const latestUserParts = [];
+      let priorUserInput = null;
 
-        for (let i = lines.length - 1; i >= startIdx; i--) {
-          let step;
-          try {
-            step = JSON.parse(lines[i]);
-          } catch {
-            continue;
-          }
+      for (let i = lines.length - 1; i >= startIdx && plannerTurnsSeen < 10; i--) {
+        let step;
+        try {
+          step = JSON.parse(lines[i]);
+        } catch {
+          continue;
+        }
 
-          if (Array.isArray(step.tool_calls)) {
-            let turnOnlySearched = step.tool_calls.length > 0;
-            for (const tc of step.tool_calls) {
-              const tName = tc?.name || '';
-              const tArgs = tc?.arguments || tc?.args || {};
-              const fPath = tArgs?.Path || tArgs?.TargetFile || '';
-              if (
-                fPath &&
-                typeof fPath === 'string' &&
-                !/[/\\]brain[/\\]/.test(fPath) &&
-                fs.existsSync(fPath)
-              ) {
+        if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
+          plannerTurnsSeen++;
+          let turnOnlySearched = true;
+          for (const tc of step.tool_calls) {
+            const tName = tc?.name || '';
+            const tArgs = tc?.arguments || tc?.args || {};
+            const fPath =
+              tArgs?.Path ||
+              tArgs?.TargetFile ||
+              tArgs?.AbsolutePath ||
+              tArgs?.SearchPath ||
+              tArgs?.DirectoryPath ||
+              '';
+            if (
+              fPath &&
+              typeof fPath === 'string' &&
+              !/[/\\]brain[/\\]/.test(fPath) &&
+              fs.existsSync(fPath)
+            ) {
+              const stat = fs.statSync(fPath);
+              if (stat.isFile()) {
                 recentFileSet.add(fPath);
               }
-              const cmd = tArgs?.CommandLine || '';
-              if (typeof cmd === 'string' && cmd) {
-                const gitC = cmd.match(/\bgit\s+-C\s+([^\s;&|]+)/);
-                if (gitC && fs.existsSync(gitC[1])) {
-                  secondaryRootSet.add(gitC[1]);
-                }
-                const cdMatch = cmd.match(/^\s*cd\s+([^\s;&|]+)/);
-                if (cdMatch && fs.existsSync(cdMatch[1])) {
-                  secondaryRootSet.add(cdMatch[1]);
-                }
-              }
-              const isSearchTool =
-                tName === 'read_file' ||
-                tName === 'view_file' ||
-                tName === 'grep_search' ||
-                tName === 'find_by_name' ||
-                (tName === 'run_command' &&
-                  /^\s*(?:cd\s+[^\s;&|]+\s*&&\s*)?(?:rg|grep|git\s+(?:-C\s+[^\s]+\s+)?grep|find|ls)\b/.test(
-                    cmd
-                  ));
-              if (!isSearchTool) {
-                turnOnlySearched = false;
+              if (stat.isDirectory() && fPath !== workspaceRoot) {
+                secondaryRootSet.add(fPath);
               }
             }
-            if (!foundLatestUser) {
-              ctx.turnsSinceUserInput++;
-              if (streakSearching && turnOnlySearched) {
-                ctx.consecutiveSearchTurns++;
-              } else {
-                streakSearching = false;
+            const cmd = tArgs?.CommandLine || '';
+            if (typeof cmd === 'string' && cmd) {
+              const gitC = cmd.match(/\bgit\s+-C\s+([^\s;&|]+)/);
+              if (gitC && fs.existsSync(gitC[1])) {
+                secondaryRootSet.add(gitC[1]);
+              }
+              const cdMatch = cmd.match(/^\s*cd\s+([^\s;&|]+)/);
+              if (cdMatch && fs.existsSync(cdMatch[1])) {
+                secondaryRootSet.add(cdMatch[1]);
               }
             }
-          } else if (
-            step.type === 'PLANNER_RESPONSE' ||
-            step.type === 'TOOL_CALL'
-          ) {
-            if (!foundLatestUser) {
-              ctx.turnsSinceUserInput++;
-            }
-            if (
-              foundLatestUser &&
-              !ctx.recentContextSummary &&
-              typeof step.content === 'string' &&
-              step.content.trim()
-            ) {
-              ctx.recentContextSummary = step.content
-                .replace(/\s+/g, ' ')
-                .trim()
-                .slice(0, 320);
+            const isSearchTool =
+              tName === 'read_file' ||
+              tName === 'view_file' ||
+              tName === 'view_file_outline' ||
+              tName === 'view_code_item' ||
+              tName === 'list_dir' ||
+              tName === 'grep_search' ||
+              tName === 'find_by_name' ||
+              (tName === 'run_command' &&
+                /^\s*(?:cd\s+[^\s;&|]+\s*&&\s*)?(?:rg|fd|grep|git\s+(?:-C\s+[^\s]+\s+)?(?:grep|log|diff|show|status)|find|ls)\b/.test(
+                  cmd
+                ));
+            if (!isSearchTool) {
+              turnOnlySearched = false;
             }
           }
-
+          if (!foundLatestUser) {
+            ctx.turnsSinceUserInput++;
+            const isSerialUnbatchedSearch =
+              turnOnlySearched && step.tool_calls.length <= 2;
+            if (streakSearching && isSerialUnbatchedSearch) {
+              ctx.consecutiveSearchTurns++;
+            }
+            if (!isSerialUnbatchedSearch) {
+              streakSearching = false;
+            }
+          }
+        } else if (
+          step.type === 'PLANNER_RESPONSE' ||
+          step.type === 'TOOL_CALL'
+        ) {
+          plannerTurnsSeen++;
+          if (!foundLatestUser) {
+            ctx.turnsSinceUserInput++;
+          }
           if (
-            !foundLatestUser &&
-            (step.type === 'USER_INPUT' ||
-              (step.step_index === 0 && step.type === 'SYSTEM_MESSAGE')) &&
-            step.content
+            foundLatestUser &&
+            !ctx.recentContextSummary &&
+            typeof step.content === 'string' &&
+            step.content.trim()
           ) {
-            const text =
-              typeof step.content === 'string'
-                ? step.content
-                : JSON.stringify(step.content);
-            const cleaned = cleanPromptText(text);
-            if (cleaned) {
+            ctx.recentContextSummary = step.content
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 320);
+          }
+        }
+
+        const isUserStep =
+          step.type === 'USER_INPUT' ||
+          (step.step_index === 0 && step.type === 'SYSTEM_MESSAGE');
+        if (isUserStep && step.content) {
+          const text =
+            typeof step.content === 'string'
+              ? step.content
+              : JSON.stringify(step.content);
+          const cleaned = cleanPromptText(text);
+          if (cleaned) {
+            if (!foundLatestUser) {
               foundLatestUser = true;
               if (ctx.turnsSinceUserInput === 0) {
-                ctx.latestUserInput = cleaned;
+                latestUserParts.unshift(cleaned);
               }
+            } else if (
+              ctx.turnsSinceUserInput === 0 &&
+              plannerTurnsSeen === 0
+            ) {
+              latestUserParts.unshift(cleaned);
+            } else if (!priorUserInput && plannerTurnsSeen <= 2) {
+              priorUserInput = cleaned;
             }
           }
         }
       }
-    } catch {
-      // fall through
+
+      if (latestUserParts.length > 0) {
+        const joinedLatest = latestUserParts.join('\n').trim();
+        ctx.latestUserInput =
+          priorUserInput && isContinuationFragment(joinedLatest)
+            ? `${priorUserInput}\n${joinedLatest}`
+            : joinedLatest;
+      }
     }
   }
 
@@ -441,38 +597,51 @@ function extractDirectoryHints(userMessage, workspaceRoot, secondaryRoots = []) 
   return [...new Set([...hints, ...secondaryRoots])];
 }
 
-function getGitDirtyFiles(workspaceRoot) {
+async function getGitDirtyFiles(workspaceRoot) {
   const dirtyMap = new Map();
-  try {
-    const gitRes = spawnSync(
-      'git',
-      ['-C', workspaceRoot, 'status', '--porcelain', '-uall'],
-      { encoding: 'utf8', timeout: 150 }
-    );
-    if (!gitRes.stdout) {
-      return dirtyMap;
+  const gitRes = await runProcessAsync(
+    'git',
+    ['-C', workspaceRoot, 'status', '--porcelain', '-uall'],
+    150
+  );
+  if (!gitRes.stdout) {
+    return dirtyMap;
+  }
+  const lines = gitRes.stdout.trim().split(/\r?\n/).filter(Boolean);
+  for (const line of lines.slice(0, 15)) {
+    const status = line.slice(0, 2).trim();
+    const relPath = line
+      .slice(3)
+      .trim()
+      .replace(/^.* -> /, '')
+      .replace(/^"|"$/g, '');
+    const absPath = path.resolve(workspaceRoot, relPath);
+    if (
+      absPath.startsWith(workspaceRoot) &&
+      fs.existsSync(absPath) &&
+      fs.statSync(absPath).isFile()
+    ) {
+      dirtyMap.set(absPath, status === '??' ? 'untracked' : 'modified');
     }
-    const lines = gitRes.stdout.trim().split(/\r?\n/).filter(Boolean);
-    for (const line of lines.slice(0, 15)) {
-      const status = line.slice(0, 2).trim();
-      const relPath = line
-        .slice(3)
-        .trim()
-        .replace(/^.* -> /, '')
-        .replace(/^"|"$/g, '');
-      const absPath = path.resolve(workspaceRoot, relPath);
-      if (
-        absPath.startsWith(workspaceRoot) &&
-        fs.existsSync(absPath) &&
-        fs.statSync(absPath).isFile()
-      ) {
-        dirtyMap.set(absPath, status === '??' ? 'untracked' : 'modified');
-      }
-    }
-  } catch {
-    // ignore non-git workspaces
   }
   return dirtyMap;
+}
+
+async function runRgCountAsync(rgArgs, timeoutMs = 350) {
+  const firstBin = resolveRgExecutable();
+  const res = await runProcessAsync(firstBin, rgArgs, timeoutMs);
+  if (
+    res.errCode === 'ENOENT' &&
+    process.platform === 'win32' &&
+    firstBin === 'rg'
+  ) {
+    const fallbackBin = resolveWindowsRgFallback();
+    if (fallbackBin !== 'rg') {
+      cachedRgExecutable = fallbackBin;
+      return runProcessAsync(fallbackBin, rgArgs, timeoutMs);
+    }
+  }
+  return res;
 }
 
 function extractRankedSymbolsWithRanges(fileText, keywords) {
@@ -589,7 +758,7 @@ function extractRankedSymbolsWithRanges(fileText, keywords) {
   };
 }
 
-function findCandidateFilesWithSummaries(
+async function findCandidateFilesWithSummaries(
   userMessage,
   workspaceRoot,
   transcriptCtx = {}
@@ -614,15 +783,99 @@ function findCandidateFilesWithSummaries(
       userMessage,
       transcriptCtx.recentContextSummary || ''
     );
-    const dirtyMap = getGitDirtyFiles(workspaceRoot);
-    for (const secRoot of secondaryRoots.slice(0, 2)) {
-      for (const [k, v] of getGitDirtyFiles(secRoot).entries()) {
+    const wantsTests =
+      /\b(test|tests|testing|spec|specs|assert|mock|mocks|benchmark|apitest)\b|_test\.|\.test\.|\.spec\./i.test(
+        userMessage
+      );
+    const isInlineSelection =
+      /<(?:SELECTION|CODE_SELECTION|ACTIVE_DOCUMENT|SELECTED_CODE)\b/i.test(
+        userMessage
+      );
+
+    const gitRoots = [workspaceRoot, ...secondaryRoots.slice(0, 2)];
+    const rgPromise =
+      uniqueKeywords.length > 0 && !isInlineSelection
+        ? (() => {
+            const pattern = uniqueKeywords
+              .map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+              .join('|');
+            const globs = [
+              '-g', '!node_modules/**',
+              '-g', '!.git/**',
+              '-g', '!vendor/**',
+              '-g', '!dist/**',
+              '-g', '!build/**',
+              '-g', '!target/**',
+              '-g', '!.next/**',
+              '-g', '!coverage/**',
+              '-g', '!*.lock',
+              '-g', '!package-lock.json',
+              '-g', '!*.pb.go',
+              '-g', '!*.bob.go',
+              '-g', '!*.sql.go',
+              '-g', '!*.gen.go',
+              '-g', '!*_gen.go',
+              '-g', '!*.gen.ts',
+              '-g', '!*.generated.ts',
+              '-g', '!*.g.dart',
+              '-g', '!*.freezed.dart',
+              '-g', '!*.min.js',
+            ];
+            if (!wantsTests) {
+              globs.push(
+                '-g', '!*mock*.go',
+                '-g', '!*_test.go',
+                '-g', '!*_test.ts',
+                '-g', '!*_test.dart',
+                '-g', '!*.spec.ts',
+                '-g', '!*.test.ts',
+                '-g', '!*.spec.js',
+                '-g', '!*.test.js'
+              );
+            }
+            return runRgCountAsync(
+              [
+                '-i',
+                '-c',
+                '--no-messages',
+                '--max-filesize',
+                '200K',
+                ...globs,
+                pattern,
+                ...searchPaths,
+              ],
+              350
+            );
+          })()
+        : Promise.resolve({ stdout: '' });
+
+    const [dirtyMaps, rgRes] = await Promise.all([
+      Promise.all(gitRoots.map((r) => getGitDirtyFiles(r))),
+      rgPromise,
+    ]);
+
+    const dirtyMap = new Map();
+    for (const dm of dirtyMaps) {
+      for (const [k, v] of dm.entries()) {
         dirtyMap.set(k, v);
       }
     }
+
+    const promptLower = userMessage.toLowerCase();
+    const isAllowedCandidate = (absFile) => {
+      const base = path.basename(absFile);
+      if (promptLower.includes(base.toLowerCase())) {
+        return true;
+      }
+      return !GENERATED_FILE_REGEX.test(absFile);
+    };
+
     const candidateMap = new Map();
 
     for (const absFile of recentFiles) {
+      if (!isAllowedCandidate(absFile)) {
+        continue;
+      }
       const relFile = absFile.startsWith(workspaceRoot)
         ? path.relative(workspaceRoot, absFile)
         : absFile;
@@ -638,6 +891,9 @@ function findCandidateFilesWithSummaries(
     }
 
     for (const [absFile, gitStatus] of dirtyMap.entries()) {
+      if (!isAllowedCandidate(absFile)) {
+        continue;
+      }
       const relFile = absFile.startsWith(workspaceRoot)
         ? path.relative(workspaceRoot, absFile)
         : absFile;
@@ -653,85 +909,30 @@ function findCandidateFilesWithSummaries(
       });
     }
 
-    if (uniqueKeywords.length > 0) {
-      const pattern = uniqueKeywords
-        .map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-        .join('|');
-
-      const rgRes = spawnSync(
-        resolveRgExecutable(),
-        [
-          '-i',
-          '-c',
-          '--no-messages',
-          '--max-filesize',
-          '200K',
-          '-g',
-          '!node_modules/**',
-          '-g',
-          '!.git/**',
-          '-g',
-          '!vendor/**',
-          '-g',
-          '!dist/**',
-          '-g',
-          '!build/**',
-          '-g',
-          '!target/**',
-          '-g',
-          '!.next/**',
-          '-g',
-          '!coverage/**',
-          '-g',
-          '!*.lock',
-          '-g',
-          '!package-lock.json',
-          '-g',
-          '!*.pb.go',
-          '-g',
-          '!*mock*.go',
-          '-g',
-          '!*_test.go',
-          '-g',
-          '!*_test.ts',
-          '-g',
-          '!*_test.dart',
-          '-g',
-          '!*.spec.ts',
-          '-g',
-          '!*.test.ts',
-          '-g',
-          '!*.g.dart',
-          '-g',
-          '!*.freezed.dart',
-          pattern,
-          ...searchPaths,
-        ],
-        { encoding: 'utf8', timeout: 350 }
-      );
-
-      if (rgRes.stdout) {
-        const rgLines = rgRes.stdout.trim().split(/\r?\n/).filter(Boolean);
-        for (const line of rgLines) {
-          const lastColon = line.lastIndexOf(':');
-          if (lastColon === -1) continue;
-          const absFile = line.slice(0, lastColon);
-          const count = parseInt(line.slice(lastColon + 1), 10) || 0;
-          const relFile = absFile.startsWith(workspaceRoot)
-            ? path.relative(workspaceRoot, absFile)
-            : absFile;
-          const keywordHits = uniqueKeywords.filter((kw) =>
-            relFile.toLowerCase().includes(kw.toLowerCase())
-          ).length;
-          const prev = candidateMap.get(absFile);
-          const rgScore = keywordHits * 40 + Math.min(count, 40);
-          candidateMap.set(absFile, {
-            absFile,
-            relFile,
-            gitStatus: prev?.gitStatus || 'clean',
-            rankScore: (prev?.rankScore || 0) + rgScore,
-          });
+    if (rgRes.stdout) {
+      const rgLines = rgRes.stdout.trim().split(/\r?\n/).filter(Boolean);
+      for (const line of rgLines) {
+        const lastColon = line.lastIndexOf(':');
+        if (lastColon === -1) continue;
+        const absFile = line.slice(0, lastColon);
+        if (!isAllowedCandidate(absFile)) {
+          continue;
         }
+        const count = parseInt(line.slice(lastColon + 1), 10) || 0;
+        const relFile = absFile.startsWith(workspaceRoot)
+          ? path.relative(workspaceRoot, absFile)
+          : absFile;
+        const keywordHits = uniqueKeywords.filter((kw) =>
+          relFile.toLowerCase().includes(kw.toLowerCase())
+        ).length;
+        const prev = candidateMap.get(absFile);
+        const rgScore = keywordHits * 40 + Math.min(count, 40);
+        candidateMap.set(absFile, {
+          absFile,
+          relFile,
+          gitStatus: prev?.gitStatus || 'clean',
+          rankScore: (prev?.rankScore || 0) + rgScore,
+        });
       }
     }
 
@@ -855,10 +1056,23 @@ async function handlePreInvocation(payload) {
   const transcriptCtx = extractTranscriptContext(payload, workspaceRoot);
   const userMessage = transcriptCtx.latestUserInput;
 
-  // Turn 2+ stateful continuation & loop-breaker (zero API cost)
   if (!userMessage) {
     const sessionState = getSessionState(payload?.conversationId);
-    if (transcriptCtx.consecutiveSearchTurns >= 4) {
+    const loopThreshold =
+      sessionState?.executionMode === 'codebase_audit_or_answer' ? 5 : 4;
+    const overThreshold = transcriptCtx.consecutiveSearchTurns - loopThreshold;
+    const shouldFireLoopBreaker =
+      overThreshold >= 0 &&
+      overThreshold % 3 === 0 &&
+      sessionState?.lastLoopBreakerTurn !== transcriptCtx.turnsSinceUserInput;
+
+    if (shouldFireLoopBreaker) {
+      if (sessionState) {
+        setSessionState(payload?.conversationId, {
+          ...sessionState,
+          lastLoopBreakerTurn: transcriptCtx.turnsSinceUserInput,
+        });
+      }
       const savedFiles = (sessionState?.topFiles || [])
         .map((f) => `${f.file}${f.primaryRange ? ` (${f.primaryRange})` : ''}`)
         .join(', ');
@@ -871,7 +1085,7 @@ async function handlePreInvocation(payload) {
       return {
         injectSteps: [
           {
-            ephemeralMessage: `[JEV CONVERGENCE GUARD] You have spent ${transcriptCtx.consecutiveSearchTurns} consecutive turns running searches.${targetNote} Stop serial grep/search calls: batch any final read_file/view_file calls now and proceed directly to your edit or final answer.`,
+            ephemeralMessage: `[JEV CONVERGENCE GUARD] You have spent ${transcriptCtx.consecutiveSearchTurns} consecutive unbatched search turns.${targetNote} Stop serial grep/search calls: batch any final read_file/view_file calls now and proceed directly to your edit or final answer.`,
           },
         ],
       };
@@ -895,7 +1109,6 @@ async function handlePreInvocation(payload) {
     return {};
   }
 
-  // Fast local short-circuit for trivial approvals or git ops (<1ms, 0 API cost)
   if (
     userMessage.length < 65 &&
     /^(yes|yep|ok|okay|sure|please\s+proceed|proceed|go\s+ahead|do\s+it|lgtm|commit(\s+and\s+push)?|push\s+to\s+.*|make\s+a?\s*pr|create\s+a?\s*pr)\b/i.test(
@@ -909,7 +1122,7 @@ async function handlePreInvocation(payload) {
     return {};
   }
 
-  const candidates = findCandidateFilesWithSummaries(
+  const candidates = await findCandidateFilesWithSummaries(
     userMessage,
     workspaceRoot,
     transcriptCtx
@@ -1195,21 +1408,24 @@ async function handlePreToolUse(payload) {
   const toolName = payload?.toolCall?.name || '';
   const args = payload?.toolCall?.args || {};
 
-  // Token-saving guard for unbounded read_file / view_file on lockfiles or pre-ranked large files
   if (toolName === 'read_file' || toolName === 'view_file') {
     const readPath = args?.Path || args?.AbsolutePath || args?.TargetFile || '';
-    const hasLineBounds = args?.StartLine != null || args?.EndLine != null;
-    if (!readPath || hasLineBounds) {
+    if (!readPath) {
+      return { decision: 'allow' };
+    }
+    const startArg = args?.StartLine;
+    const endArg = args?.EndLine;
+    const hasExplicitNarrowBounds =
+      (startArg != null || endArg != null) &&
+      !(
+        (startArg == null || startArg <= 1) &&
+        (endArg == null || endArg - (startArg || 1) >= 500)
+      );
+    if (hasExplicitNarrowBounds) {
       return { decision: 'allow' };
     }
 
-    const base = path.basename(readPath);
-    if (
-      /^(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum|composer\.lock|poetry\.lock)$/.test(
-        base
-      ) ||
-      /\.(pb\.go|g\.dart|freezed\.dart|min\.js)$/.test(base)
-    ) {
+    if (GENERATED_FILE_REGEX.test(readPath)) {
       logTelemetry({
         hook: 'PreToolUse:read_cap',
         toolName,
@@ -1226,11 +1442,14 @@ async function handlePreToolUse(payload) {
     }
 
     const sessionState = getSessionState(payload?.conversationId);
-    const rankedMatch = (sessionState?.topFiles || []).find(
-      (f) => f.absFile === readPath || readPath.endsWith(`/${f.file}`)
-    );
+    const normRead = readPath.replace(/\\/g, '/');
+    const rankedMatch = (sessionState?.topFiles || []).find((f) => {
+      const normAbs = (f.absFile || '').replace(/\\/g, '/');
+      const normRel = (f.file || '').replace(/\\/g, '/');
+      return normAbs === normRead || (normRel && normRead.endsWith(`/${normRel}`));
+    });
     const alreadySliced = (sessionState?.autoSlicedFiles || []).includes(
-      readPath
+      normRead
     );
     if (
       rankedMatch &&
@@ -1246,7 +1465,7 @@ async function handlePreToolUse(payload) {
       );
       setSessionState(payload?.conversationId, {
         ...sessionState,
-        autoSlicedFiles: [...(sessionState?.autoSlicedFiles || []), readPath],
+        autoSlicedFiles: [...(sessionState?.autoSlicedFiles || []), normRead],
       });
       logTelemetry({
         hook: 'PreToolUse:read_slice',
@@ -1275,7 +1494,8 @@ async function handlePreToolUse(payload) {
     toolName === 'edit_file' ||
     toolName === 'write_file'
   ) {
-    const targetFile = args?.TargetFile || args?.Path || '';
+    const targetFile =
+      args?.TargetFile || args?.Path || args?.AbsolutePath || '';
 
     const sessionState = getSessionState(payload?.conversationId);
     if (
@@ -1302,19 +1522,24 @@ async function handlePreToolUse(payload) {
       return { decision: 'allow' };
     }
 
-    // Fast syntactic pre-screening: only ask Jev questions whose triggers exist in addedCode
-    const hasComments = /\/\/|\/\*|^\s*#/m.test(addedCode);
+    const isTestFile =
+      /(?:_test\.go|\.(?:test|spec)\.[jt]sx?|_test\.dart)$/i.test(targetFile);
+    const hasSuspiciousComments =
+      /(?:(?<!:)\/\/|\/\*|^\s*#(?!\!))\s*(?:step\s*\d|phase\s*\d|part\s*\d|stage\s*\d|first,|second,|third,|finally,|hack\b|workaround\b|temp(?:orary)?\b|fragile\b|do\s+not\s+touch|kludge\b|band-?aid\b|apolog|todo\b|fixme\b|xxx\b|initialize\s+var|validate\s+input|return\s+result)/im.test(
+        addedCode
+      ) ||
+      (addedCode.match(/^\s+(?:(?<!:)\/\/|#(?!\!))\s+\S/gm) || []).length >= 3;
     const hasElse = /\belse\b/.test(addedCode);
     const hasGoErrNil = ext === '.go' && /\berr\s*==\s*nil\b/.test(addedCode);
     const hasGoRawErrorsNew =
-      ext === '.go' && /\berrors\.New\s*\(/.test(addedCode);
+      ext === '.go' && !isTestFile && /\berrors\.New\s*\(/.test(addedCode);
     const hasErrorConstruct =
       /\b(catch\s*(\(|{)|err\s*(!=|==)\s*nil|_\s*=\s*\w+|except\b|rescue\b)/.test(
         addedCode
       );
 
     const codeQuestions = {};
-    if (hasComments) {
+    if (hasSuspiciousComments) {
       codeQuestions.has_narrative_comments = {
         type: 'noul',
         instructions:
@@ -1629,17 +1854,38 @@ async function handlePreToolUse(payload) {
 
 function isDuplicateStep(mode, payload) {
   const convId = payload?.conversationId || '';
+  if (!convId) {
+    return false;
+  }
   const args = payload?.toolCall?.args || {};
   const targetDiscriminator =
     args?.TargetFile ||
     args?.Path ||
+    args?.AbsolutePath ||
     (args?.CommandLine || '').slice(0, 60) ||
     '';
-  const stepKey =
-    mode === 'PreInvocation'
-      ? `inv:${payload?.invocationNum ?? ''}:${payload?.initialNumSteps ?? ''}`
-      : `step:${payload?.stepIdx ?? ''}:${payload?.toolCall?.name ?? ''}:${targetDiscriminator}`;
-  if (!convId || stepKey.endsWith('::')) {
+
+  let stepKey = '';
+  if (mode === 'PreInvocation') {
+    const invNum = payload?.invocationNum ?? '';
+    const initSteps = payload?.initialNumSteps ?? '';
+    if (invNum !== '' || initSteps !== '') {
+      stepKey = `inv:${invNum}:${initSteps}`;
+    } else if (payload?.transcriptPath && fs.existsSync(payload.transcriptPath)) {
+      try {
+        stepKey = `inv:tx:${fs.statSync(payload.transcriptPath).size}`;
+      } catch {
+        return false;
+      }
+    }
+  } else {
+    const toolName = payload?.toolCall?.name ?? '';
+    if (toolName) {
+      stepKey = `step:${payload?.stepIdx ?? ''}:${toolName}:${targetDiscriminator}`;
+    }
+  }
+
+  if (!stepKey) {
     return false;
   }
   const dedupPath = path.join(os.tmpdir(), `jev-hook-last-step-${convId}.json`);

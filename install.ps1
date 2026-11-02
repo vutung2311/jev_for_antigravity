@@ -241,25 +241,67 @@ function Generate-WindowsHooksJson {
     return ($hooksObj | ConvertTo-Json -Depth 10)
 }
 
+function Remove-LegacyGlobalJevHooks {
+    param([string]$HookFile)
+    if (-not (Test-Path $HookFile)) { return }
+    try {
+        $raw = Get-Content -Raw -Path $HookFile -Encoding utf8
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            Remove-Item $HookFile -Force -ErrorAction SilentlyContinue
+            return
+        }
+        $data = $raw | ConvertFrom-Json -AsHashtable
+        $data.Remove("jev-intent-router") | Out-Null
+        $data.Remove("jev-tool-guardrail") | Out-Null
+        if ($data.Count -eq 0) {
+            Remove-Item $HookFile -Force -ErrorAction SilentlyContinue
+        } else {
+            ($data | ConvertTo-Json -Depth 10) | Out-File -FilePath $HookFile -Encoding utf8 -Force
+        }
+    } catch {
+        # Preserve malformed user hooks.json untouched
+    }
+}
+
+function Stop-JevDaemon {
+    try {
+        Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match "jev-daemon\.mjs" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
+}
+
+function Remove-LegacyMcpSchemas {
+    foreach ($productDir in @("antigravity", "antigravity-ide")) {
+        foreach ($legacyDir in @("jev-coprocessor-mcp", "jev-coprocessor_jev-coprocessor-mcp")) {
+            $p = Join-Path $TargetHome ".gemini\$productDir\mcp\$legacyDir"
+            if (Test-Path $p) {
+                Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 function Run-SmokeCheck {
     Write-Cyan "Running Jev Co-Processor Windows health check..."
 
     $hookMjs = Join-Path $PluginDest "bin\jev-hook.mjs"
+    $daemonMjs = Join-Path $PluginDest "bin\jev-daemon.mjs"
     $hookCmd = Join-Path $PluginDest "bin\jev-hook.cmd"
 
-    if (-not (Test-Path $hookMjs)) {
-        Write-Red "  x Plugin script not found at $hookMjs"
+    if (-not (Test-Path $hookMjs) -or -not (Test-Path $daemonMjs)) {
+        Write-Red "  x Plugin scripts incomplete at $PluginDest"
         exit 1
     }
-    Write-Green "  [OK] Plugin scripts present at $PluginDest"
+    Write-Green "  [OK] Plugin & warm daemon scripts present at $PluginDest"
 
     # Verify link into product directories
     foreach ($productDir in @("antigravity", "antigravity-ide")) {
         $agyDir = Join-Path $TargetHome ".gemini\$productDir"
         if (Test-Path $agyDir) {
-            $agyHooks = Join-Path $agyDir "hooks.json"
+            $pluginHooks = Join-Path $PluginDest "hooks.json"
             $agyPlugin = Join-Path $agyDir "plugins\jev-coprocessor"
-            if ((Test-Path $agyHooks) -and (Test-Path $agyPlugin)) {
+            if ((Test-Path $pluginHooks) -and (Test-Path $agyPlugin)) {
                 Write-Green "  [OK] Integrated with $agyDir"
             } else {
                 Write-Yellow "  ! Missing integration in $agyDir (run install.ps1 to repair)"
@@ -313,6 +355,8 @@ function Install-Plugin {
     Write-Cyan "=========================================================="
 
     Test-Prerequisites
+    Stop-JevDaemon
+    Remove-LegacyMcpSchemas
 
     # Setup directories
     $destBin = Join-Path $PluginDest "bin"
@@ -329,13 +373,14 @@ function Install-Plugin {
     Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\README.md") (Join-Path $PluginDest "README.md") -Force
     Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\assets\logo.svg") (Join-Path $destAssets "logo.svg") -Force
     Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\bin\jev-client.mjs") (Join-Path $destBin "jev-client.mjs") -Force
+    Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\bin\jev-daemon.mjs") (Join-Path $destBin "jev-daemon.mjs") -Force
     Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\bin\jev-hook.mjs") (Join-Path $destBin "jev-hook.mjs") -Force
     Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\bin\jev-hook.cmd") (Join-Path $destBin "jev-hook.cmd") -Force
 
-    # Generate and write Windows hooks.json
+    # Generate canonical plugin hooks.json and prune duplicate top-level Jev hook entries
     $hooksJsonContent = Generate-WindowsHooksJson
-    $hooksJsonContent | Out-File -FilePath (Join-Path $ConfigDir "hooks.json") -Encoding utf8 -Force
     $hooksJsonContent | Out-File -FilePath (Join-Path $PluginDest "hooks.json") -Encoding utf8 -Force
+    Remove-LegacyGlobalJevHooks (Join-Path $ConfigDir "hooks.json")
 
     # Enable in config.json
     Update-ConfigJsonPlugin -Enable $true
@@ -347,8 +392,7 @@ function Install-Plugin {
         $agyPlugins = Join-Path $agyDir "plugins"
         New-Item -ItemType Directory -Force -Path $agyPlugins | Out-Null
 
-        # Copy hooks.json
-        Copy-Item (Join-Path $ConfigDir "hooks.json") (Join-Path $agyDir "hooks.json") -Force
+        Remove-LegacyGlobalJevHooks (Join-Path $agyDir "hooks.json")
 
         # Create Junction or directory copy
         $agyPluginLink = Join-Path $agyPlugins "jev-coprocessor"
@@ -382,11 +426,12 @@ function Install-Plugin {
 
 function Uninstall-Plugin {
     Write-Cyan "Uninstalling Jev System One Co-Processor on Windows..."
+    Stop-JevDaemon
+    Remove-LegacyMcpSchemas
 
     foreach ($productDir in @("antigravity", "antigravity-ide")) {
         $agyDir = Join-Path $TargetHome ".gemini\$productDir"
-        $hookFile = Join-Path $agyDir "hooks.json"
-        if (Test-Path $hookFile) { Remove-Item $hookFile -Force }
+        Remove-LegacyGlobalJevHooks (Join-Path $agyDir "hooks.json")
 
         $agyPlugin = Join-Path $agyDir "plugins\jev-coprocessor"
         if (Test-Path $agyPlugin) {
@@ -402,8 +447,7 @@ function Uninstall-Plugin {
         }
     }
 
-    $globalHook = Join-Path $ConfigDir "hooks.json"
-    if (Test-Path $globalHook) { Remove-Item $globalHook -Force }
+    Remove-LegacyGlobalJevHooks (Join-Path $ConfigDir "hooks.json")
 
     if (Test-Path $PluginDest) {
         Remove-Item $PluginDest -Recurse -Force

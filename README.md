@@ -73,24 +73,24 @@ cd jev_for_antigravity
 
 ## Architecture
 
-1. **`PreInvocation` — Executive Decision Engine (~370ms cold / <5ms cached)**:
-   - Evaluates the incoming user prompt, recent `transcript.jsonl` conversation context, and subagent initial messages in a single batched `POST https://api.typesafe.ai/v1/systemone` request using `Choice` and `Noul` primitives (`execution_mode`, `is_self_contained_spec`, `is_investigatory_question_only`, `is_underspecified_or_ambiguous`, `verification_strategy`, and candidate file probabilities).
-   - Dynamically discovers candidate files in **any** repository by combining `git status --porcelain` (dirty/modified/untracked files), recently read/edited files from `transcript.jsonl`, secondary git worktree roots, and identifier-prioritized `rg` searches across 21+ source languages.
+1. **`PreInvocation` — Executive Decision Engine (~215ms warm / <2ms cached)**:
+   - Evaluates the incoming user prompt (automatically merging queued/continuation follow-up fragments), $O(1)$ tail-read `transcript.jsonl` context across parallel tool turns, and subagent initial messages in a single batched `POST https://api.typesafe.ai/v1/systemone` request using `Choice` and `Noul` primitives (`execution_mode`, `is_self_contained_spec`, `is_investigatory_question_only`, `is_underspecified_or_ambiguous`, `verification_strategy`, and candidate file probabilities).
+   - Dynamically discovers candidate files in **any** repository by running `git status --porcelain` and identifier-prioritized `rg` concurrently across 21+ source languages, filtering generated files (`*.pb.go`, `*.bob.go`, `*.sql.go`, `*_gen.go`, `*.gen.ts`, `*.g.dart`) while conditionally including test files when test/assertion terms appear in the prompt.
    - Extracts and ranks top symbols by full-body keyword relevance (`[hits: L<line>]`) with exact `L<start>-L<end>` line ranges and matching code snippets (`match_preview`) so the planner can call `read_file` / `view_file` with `StartLine`/`EndLine` slices in a single parallel Turn 1 batch.
-   - Prevents Turn-2+ amnesia and search loops by persisting the session plan and injecting zero-API-cost Turn-2 reminders and Turn-4+ **Convergence Guards** when the agent runs consecutive search turns.
+   - Prevents Turn-2+ amnesia and unbatched serial search loops by persisting the session plan and injecting zero-API-cost Turn-2 reminders and rate-limited **Convergence Guards**.
    - Persists a **Question-First Read-Only Lock** (`/tmp/jev-session-<conversationId>.json`) when `execution_mode === "codebase_audit_or_answer"` and `is_investigatory_question_only >= 0.88`.
 
-2. **`PreToolUse` — Synchronous Code, Read, & Command Guardrail (<1ms local pre-screen / ~370ms Jev)**:
-   - **Auto-Slicing & Lockfile Capping (`read_file`, `view_file`)**: Automatically caps unbounded reads of lockfiles/generated code to `L1-L120` and auto-slices first-time unbounded reads of large (`>450` line) Jev-ranked files to their primary matched symbol range via `overwrite: { StartLine, EndLine }`.
+2. **`PreToolUse` — Synchronous Code, Read, & Command Guardrail (<1ms local pre-screen / ~215ms warm Jev)**:
+   - **Auto-Slicing & Generated/Lockfile Capping (`read_file`, `view_file`)**: Automatically caps unbounded or wide reads of lockfiles/generated code to `L1-L120` and auto-slices first-time wide/unbounded reads of large (`>450` line) Jev-ranked files across both `Path` and Antigravity IDE `AbsolutePath` arguments via `overwrite: { StartLine, EndLine }`.
    - **Question-First Lock Enforcement**: Blocks unrequested file edits (`decision: "deny"`) during investigatory/explanatory question turns until the user asks to apply changes.
-   - **Syntactically Pre-Screened Code Edit Gate (`edit_file`, `write_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`)**: Pre-screens diffs locally in `<1ms` and queries Jev only for active syntactic triggers (`has_narrative_comments`, `has_apology_or_hack_comments`, `has_else_after_return`, `has_err_nil_happy_path`, `swallows_error_silently`, `uses_raw_errors_new_in_go`), blocking (`decision: "deny"`) violations before disk write.
+   - **Precision-Screened Code Edit Gate (`edit_file`, `write_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`)**: Pre-screens diffs locally in `<1ms` (ignoring URLs inside strings, standard GoDoc/JSDoc headers, and `errors.New` in unit tests) and queries Jev only for active syntactic triggers (`has_narrative_comments`, `has_apology_or_hack_comments`, `has_else_after_return`, `has_err_nil_happy_path`, `swallows_error_silently`, `uses_raw_errors_new_in_go`), blocking (`decision: "deny"`) violations before disk write.
    - **Shell Command Gate & Zero-Turn Auto-Sanitization (`run_command`)**:
      - Fast-allows commands with zero risk tokens in `<1ms` (eliminating ~90% of redundant API calls).
      - Escalates destructive deletes (`rm -rf`, `git reset --hard`, schema drops) and remote force-pushes (`git push --force`) to `decision: "force_ask"`.
      - Uses `PreToolUse` `overwrite: { CommandLine: ... }` to **auto-sanitize** trailing `|| true` on test/build/linter commands and dynamically rewrite `sudo <cmd>` to `pkexec <cmd>` (or `run0 <cmd>` when `NoNewPrivs=1` is detected) in-place without burning an extra LLM retry turn.
 
-3. **Content-Addressed 60s Response Cache (`/tmp/jev-response-cache.json`)**:
-   - Hashes `{ model, state, questions }` with SHA-256 and serves identical evaluations within 60 seconds in `<5ms` with zero API cost.
+3. **Keep-Alive Local Co-Processor Daemon & 5m LRU/Atomic Cache (`jev-daemon.mjs`)**:
+   - Auto-spawns an idle-timeout background IPC daemon (Unix socket `/tmp/jev-coprocessor-v2-<uid>.sock` / Windows Named Pipe) maintaining a pre-warmed HTTPS Keep-Alive pool to `api.typesafe.ai` (**cutting API latency from ~470ms cold to ~215ms warm**), in-flight SHA-256 request coalescing, and an in-memory + atomic disk 5-minute response cache (`<1ms` hits).
 
 ---
 
