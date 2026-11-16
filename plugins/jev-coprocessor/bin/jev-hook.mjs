@@ -1009,6 +1009,91 @@ function discoverApplicableRules(workspaceRoot, targetFiles) {
   return [...found].slice(0, 4);
 }
 
+function getMemoryPath(conversationId) {
+  if (!conversationId) return null;
+  const safeId = String(conversationId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  return path.join(os.tmpdir(), 'jev-ctx', `memory-${safeId}.json`);
+}
+
+function getPersistentMemory(conversationId) {
+  const p = getMemoryPath(conversationId);
+  if (!p || !fs.existsSync(p)) {
+    return { editedFiles: [], failedCommands: [], logFiles: [] };
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return {
+      editedFiles: Array.isArray(data.editedFiles) ? data.editedFiles : [],
+      failedCommands: Array.isArray(data.failedCommands) ? data.failedCommands : [],
+      logFiles: Array.isArray(data.logFiles) ? data.logFiles : [],
+    };
+  } catch (err) {
+    logTelemetry({ hook: 'PostToolUse:memory_read', error: String(err?.message || err) });
+    return { editedFiles: [], failedCommands: [], logFiles: [] };
+  }
+}
+
+function savePersistentMemory(conversationId, mem) {
+  const p = getMemoryPath(conversationId);
+  if (!p) return;
+  try {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify({ ...mem, updatedAt: Date.now() }), 'utf8');
+  } catch (err) {
+    logTelemetry({ hook: 'PostToolUse:memory_write', error: String(err?.message || err) });
+  }
+}
+
+function handlePostToolUse(payload) {
+  const convId = payload?.conversationId;
+  const toolName = payload?.toolCall?.name || '';
+  const args = payload?.toolCall?.args || {};
+  if (!convId || !toolName) {
+    return {};
+  }
+
+  const mem = getPersistentMemory(convId);
+  const editTools = new Set([
+    'replace_file_content',
+    'multi_replace_file_content',
+    'write_to_file',
+    'edit_file',
+    'write_file',
+  ]);
+
+  if (editTools.has(toolName)) {
+    const targetFile = args?.TargetFile || args?.Path || args?.AbsolutePath || '';
+    if (targetFile && !/[/\\]brain[/\\]/.test(targetFile)) {
+      mem.editedFiles = [
+        targetFile,
+        ...mem.editedFiles.filter((f) => f !== targetFile),
+      ].slice(0, 15);
+    }
+  } else if (toolName === 'run_command') {
+    const cmd = String(args?.CommandLine || '').trim();
+    if (payload?.error && cmd) {
+      const entry = `${cmd.slice(0, 100)} -> ${String(payload.error).slice(0, 100)}`;
+      mem.failedCommands = [entry, ...mem.failedCommands].slice(0, 8);
+    }
+    const safeId = String(convId).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const stepLog = path.join(
+      os.tmpdir(),
+      'jev-logs',
+      safeId,
+      `step-${payload?.stepIdx ?? ''}.log`
+    );
+    if (payload?.stepIdx != null && fs.existsSync(stepLog)) {
+      mem.logFiles = [
+        stepLog,
+        ...mem.logFiles.filter((l) => l !== stepLog),
+      ].slice(0, 8);
+    }
+  }
+
+  savePersistentMemory(convId, mem);
+  return {};
+}
+
 function setSessionState(conversationId, stateObj) {
   if (!conversationId) {
     return;
@@ -1187,6 +1272,15 @@ async function handlePreInvocation(payload) {
           'Run a fast static analyzer or typechecker on the modified package',
       },
     },
+    needs_heavy_log_or_data_exec: {
+      type: 'noul',
+      instructions:
+        'Does `user_prompt` involve inspecting large logs, running a broad test/build suite, or analyzing bulky command output where sandboxed FTS5 indexing (`jev_exec` / `jev_search`) would save context?',
+      criteria: {
+        true: 'Task involves heavy log inspection, broad test/build output, or bulk data processing',
+        false: 'Normal code read/edit or short command',
+      },
+    },
   };
 
   candidates.forEach((cand, idx) => {
@@ -1200,6 +1294,31 @@ async function handlePreInvocation(payload) {
     };
   });
 
+  const persistentMem = getPersistentMemory(payload?.conversationId);
+  const hasPersistentMem =
+    persistentMem.editedFiles.length > 0 ||
+    persistentMem.failedCommands.length > 0 ||
+    persistentMem.logFiles.length > 0;
+  const memorySummary = hasPersistentMem
+    ? {
+        edited_files: persistentMem.editedFiles.slice(0, 8).map((f) => path.basename(f)),
+        failed_commands: persistentMem.failedCommands.slice(0, 4),
+        saved_logs: persistentMem.logFiles.slice(0, 4),
+      }
+    : null;
+
+  if (memorySummary) {
+    questions.include_session_memory = {
+      type: 'noul',
+      instructions:
+        'Are any items in `session_memory` (previously edited files, recent command errors, or saved log paths) relevant to `user_prompt`?',
+      criteria: {
+        true: 'Session memory items provide useful continuity for `user_prompt`',
+        false: 'Unrelated to `user_prompt`',
+      },
+    };
+  }
+
   try {
     const res = await evaluateSystemOne({
       state: {
@@ -1208,6 +1327,7 @@ async function handlePreInvocation(payload) {
         ...(transcriptCtx.recentContextSummary
           ? { recent_context: transcriptCtx.recentContextSummary }
           : {}),
+        ...(memorySummary ? { session_memory: memorySummary } : {}),
         candidate_files: candidates.map((c) => ({
           file: c.file,
           git_status: c.gitStatus,
@@ -1227,6 +1347,10 @@ async function handlePreInvocation(payload) {
       res.answers?.is_underspecified_or_ambiguous?.noul ?? 0;
     const verifyStrategy =
       res.answers?.verification_strategy?.choice || 'targeted_unit_test';
+    const needsHeavyExec =
+      res.answers?.needs_heavy_log_or_data_exec?.noul ?? 0;
+    const includeMemory =
+      res.answers?.include_session_memory?.noul ?? 0;
 
     const topFiles = candidates
       .map((c, idx) => {
@@ -1268,6 +1392,11 @@ async function handlePreInvocation(payload) {
       executionMode: mode,
       verifyStrategy,
       turn2Reminder,
+      lastPrompt: userMessage.slice(0, 500),
+      lastKeywords: extractPrioritizedKeywords(
+        userMessage,
+        transcriptCtx.recentContextSummary || ''
+      ),
       topFiles: topFiles.map((f) => ({
         file: f.file,
         absFile: f.absFile,
@@ -1307,6 +1436,26 @@ async function handlePreInvocation(payload) {
       isAmbiguous >= 0.85 && mode === 'codebase_edit'
         ? `\n- AMBIGUITY ALERT (p=${isAmbiguous.toFixed(2)}): Requirements appear underspecified. Inspect the primary file slice below once, then ask a concise clarifying question before making broad architectural changes.`
         : '';
+    const ctxMcpNote =
+      needsHeavyExec >= 0.85
+        ? `\n- CONTEXT-MODE ROUTING (p=${needsHeavyExec.toFixed(2)}): For heavy log/test/build output, prefer \`jev_exec\` + \`jev_search\` (or \`jev_index\` on large files) to keep raw output out of context.`
+        : '';
+    const memParts = [];
+    if (memorySummary && includeMemory >= 0.7) {
+      if (memorySummary.edited_files.length > 0) {
+        memParts.push(`edited=[${memorySummary.edited_files.join(', ')}]`);
+      }
+      if (memorySummary.failed_commands.length > 0) {
+        memParts.push(`recent_errors=[${memorySummary.failed_commands[0]}]`);
+      }
+      if (memorySummary.saved_logs.length > 0) {
+        memParts.push(`logs=[${memorySummary.saved_logs.join(', ')}]`);
+      }
+    }
+    const memNote =
+      memParts.length > 0
+        ? `\n- SESSION MEMORY (p=${includeMemory.toFixed(2)}): ${memParts.join(' | ')}`
+        : '';
 
     let directive = '';
     if (mode === 'direct_code_write' || isSelfContained >= 0.75) {
@@ -1333,7 +1482,7 @@ async function handlePreInvocation(payload) {
       );
       directive = [
         `[JEV SYSTEM-1 EXECUTIVE PLAN (${res.latencyMs}ms) — OBEY STRICTLY]`,
-        `- Mode: CODEBASE_AUDIT_OR_ANSWER (Read-Only Question-First, Workspace=${path.basename(workspaceRoot)})${rulesNote}.`,
+        `- Mode: CODEBASE_AUDIT_OR_ANSWER (Read-Only Question-First, Workspace=${path.basename(workspaceRoot)})${rulesNote}.${ctxMcpNote}${memNote}`,
         `- PROHIBITIONS: Answer in text FIRST. Do NOT edit files or run mutating commands. Do NOT read unrelated SKILL.md or MCP schemas.`,
         ...(fileLines.length > 0
           ? [
@@ -1352,7 +1501,7 @@ async function handlePreInvocation(payload) {
       );
       directive = [
         `[JEV SYSTEM-1 EXECUTIVE PLAN (${res.latencyMs}ms) — OBEY STRICTLY]`,
-        `- Mode: CODEBASE_EDIT (Workspace=${path.basename(workspaceRoot)}, Verify=${verifyStrategy})${rulesNote}.${clarifyNote}`,
+        `- Mode: CODEBASE_EDIT (Workspace=${path.basename(workspaceRoot)}, Verify=${verifyStrategy})${rulesNote}.${clarifyNote}${ctxMcpNote}${memNote}`,
         `- PROHIBITIONS: Do NOT read unrelated SKILL.md or MCP schemas. Use StartLine/EndLine from the L<start>-L<end> ranges below instead of reading whole files.`,
         ...(fileLines.length > 0
           ? [`- Pre-Ranked Target Files & Symbol Line Ranges:`, ...fileLines]
@@ -1398,6 +1547,144 @@ function extractAddedCode(toolName, args) {
     return args?.CodeContent || '';
   }
   return '';
+}
+
+const NOISY_COMMAND_REGEX =
+  /\b(?:go\s+test|pytest|py\.test|npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|vitest|jest|cargo\s+(?:test|build|check)|mvn\s+test|gradle\s+test|docker\s+logs|kubectl\s+logs|git\s+log)\b/i;
+
+async function capUnrankedLargeRead(readPath, sessionState, conversationId) {
+  const normRead = readPath.replace(/\\/g, '/');
+  const alreadyCapped = (sessionState?.autoCappedReads || []).includes(normRead);
+  if (alreadyCapped) {
+    return null;
+  }
+  try {
+    if (!fs.existsSync(readPath)) {
+      return null;
+    }
+    const stat = fs.statSync(readPath);
+    if (!stat.isFile() || stat.size < 20480) {
+      return null;
+    }
+    const content = fs.readFileSync(readPath, 'utf8');
+    const totalLines = content.split(/\r?\n/).length;
+    if (totalLines <= 500) {
+      return null;
+    }
+
+    let capStart = 1;
+    let capEnd = 250;
+    let reason = 'default_head_cap';
+
+    const extracted = extractRankedSymbolsWithRanges(
+      content,
+      sessionState?.lastKeywords || []
+    );
+    const parsedRanges = [];
+    if (extracted.symbols) {
+      for (const seg of extracted.symbols.split('; ')) {
+        const m = /^L(\d+)-L(\d+):\s*(.+)$/.exec(seg.trim());
+        if (m) {
+          parsedRanges.push({
+            start: parseInt(m[1], 10),
+            end: parseInt(m[2], 10),
+            label: m[3],
+          });
+        }
+      }
+    }
+
+    if (parsedRanges.length > 0 && sessionState?.lastPrompt) {
+      try {
+        const criteria = { none: 'None of the symbol ranges clearly match; read file header (L1-L250)' };
+        parsedRanges.slice(0, 5).forEach((r, idx) => {
+          criteria[String(idx)] = `L${r.start}-L${r.end}: ${r.label}`;
+        });
+        const res = await evaluateSystemOne({
+          state: {
+            user_prompt: sessionState.lastPrompt,
+            file_path: path.basename(readPath),
+            total_lines: totalLines,
+          },
+          questions: {
+            target_range: {
+              type: 'choice',
+              instructions:
+                'Which symbol line range in `file_path` is most relevant to `user_prompt`?',
+              criteria,
+            },
+          },
+        });
+        const choice = res.answers?.target_range?.choice;
+        const idx = choice != null && choice !== 'none' ? parseInt(choice, 10) : NaN;
+        if (!Number.isNaN(idx) && parsedRanges[idx]) {
+          const chosen = parsedRanges[idx];
+          capStart = Math.max(1, chosen.start - 15);
+          capEnd = Math.min(totalLines, Math.max(chosen.end + 25, capStart + 140));
+          reason = `jev_symbol_slice_${idx}`;
+        }
+      } catch {
+        // Fallback to L1-L250
+      }
+    }
+
+    setSessionState(conversationId, {
+      ...(sessionState || {}),
+      autoCappedReads: [...(sessionState?.autoCappedReads || []), normRead],
+    });
+    logTelemetry({
+      hook: 'PreToolUse:read_cap_large',
+      targetFile: readPath,
+      totalLines,
+      capStart,
+      capEnd,
+      reason,
+    });
+    return {
+      decision: 'allow',
+      overwrite: {
+        StartLine: capStart,
+        EndLine: capEnd,
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function wrapNoisyCommandWithLog(cmd, args, payload, forceWrap = false) {
+  if (process.platform === 'win32' || args?.IsDaemon) {
+    return null;
+  }
+  if (!forceWrap && !NOISY_COMMAND_REGEX.test(cmd)) {
+    return null;
+  }
+  // Skip multiline commands, background jobs, or commands already redirecting/piping output
+  if (/[\r\n]/.test(cmd) || /[|>&]/.test(cmd)) {
+    return null;
+  }
+  const convId = (payload?.conversationId || 'default').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const logDir = path.join(os.tmpdir(), 'jev-logs', convId);
+  try {
+    fs.mkdirSync(logDir, { recursive: true });
+  } catch {
+    return null;
+  }
+  const stepTag = payload?.stepIdx != null ? `step-${payload.stepIdx}` : `${Date.now()}`;
+  const logPath = path.join(logDir, `${stepTag}.log`);
+  const wrappedCmd = `{ ${cmd}; } > "${logPath}" 2>&1; ec=$?; tail -n 80 "${logPath}"; lines=$(wc -l < "${logPath}" 2>/dev/null || echo 0); [ "$lines" -gt 80 ] && echo "[JEV LOG] Showing last 80 of \${lines} lines. Full log: ${logPath}"; exit $ec`;
+
+  logTelemetry({
+    hook: 'PreToolUse:command:log_offload',
+    originalCommand: cmd.slice(0, 200),
+    logPath,
+  });
+  return {
+    decision: 'allow',
+    overwrite: {
+      CommandLine: wrappedCmd,
+    },
+  };
 }
 
 async function handlePreToolUse(payload) {
@@ -1482,6 +1769,15 @@ async function handlePreToolUse(payload) {
           EndLine: sliceEnd,
         },
       };
+    }
+
+    const largeCap = await capUnrankedLargeRead(
+      readPath,
+      sessionState,
+      payload?.conversationId
+    );
+    if (largeCap) {
+      return largeCap;
     }
 
     return { decision: 'allow' };
@@ -1713,6 +2009,46 @@ async function handlePreToolUse(payload) {
       !hasOrTrueTrigger &&
       !hasSudoTrigger
     ) {
+      const logWrapped = wrapNoisyCommandWithLog(cmd, args, payload);
+      if (logWrapped) {
+        return logWrapped;
+      }
+      const isTrivialReadOnlyCmd =
+        cmd.length <= 18 ||
+        /^(?:ls|pwd|echo|which|whoami|date|uname|git\s+(?:status|branch|rev-parse|diff\s+--stat))\b/i.test(
+          cmd
+        );
+      if (
+        !isTrivialReadOnlyCmd &&
+        process.platform !== 'win32' &&
+        !args?.IsDaemon &&
+        !/[\r\n|>&]/.test(cmd)
+      ) {
+        try {
+          const res = await evaluateSystemOne({
+            state: { command_line: cmd.slice(0, 1000) },
+            questions: {
+              likely_produces_large_output: {
+                type: 'noul',
+                instructions:
+                  'Does `command_line` run a build, test suite, log dump, package install, or bulk listing likely to produce >100 lines of stdout/stderr?',
+                criteria: {
+                  true: 'Likely produces large/verbose output (>100 lines)',
+                  false: 'Short/compact output command',
+                },
+              },
+            },
+          });
+          if ((res.answers?.likely_produces_large_output?.noul ?? 0) >= 0.85) {
+            const jevWrapped = wrapNoisyCommandWithLog(cmd, args, payload, true);
+            if (jevWrapped) {
+              return jevWrapped;
+            }
+          }
+        } catch {
+          // Graceful fallback: allow command untouched
+        }
+      }
       return { decision: 'allow' };
     }
 
@@ -1927,6 +2263,12 @@ async function main() {
 
   if (mode === 'PreToolUse') {
     const out = await handlePreToolUse(payload);
+    process.stdout.write(JSON.stringify(out) + '\n');
+    return;
+  }
+
+  if (mode === 'PostToolUse') {
+    const out = handlePostToolUse(payload);
     process.stdout.write(JSON.stringify(out) + '\n');
     return;
   }
