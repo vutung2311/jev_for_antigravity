@@ -27,6 +27,8 @@ param(
     [switch]$Uninstall,
     [Alias("-check")]
     [switch]$Check,
+    [Alias("-stats")]
+    [switch]$Stats,
     [Alias("api-key", "-api-key", "key", "-key")]
     [string]$ApiKey,
     [Alias("-help", "h", "-h")]
@@ -42,6 +44,7 @@ for ($i = 0; $i -lt $rawArgs.Count; $i++) {
         '--install'   { $Install = $true }
         '--uninstall' { $Uninstall = $true }
         '--check'     { $Check = $true }
+        '--stats'     { $Stats = $true }
         '--api-key'   {
             if ($i + 1 -lt $rawArgs.Count) {
                 $ApiKey = $rawArgs[$i + 1]
@@ -64,6 +67,8 @@ if ($Uninstall) {
     $Mode = 'Uninstall'
 } elseif ($Check) {
     $Mode = 'Check'
+} elseif ($Stats) {
+    $Mode = 'Stats'
 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -235,10 +240,35 @@ function Generate-WindowsHooksJson {
                     )
                 }
             )
+            "PostToolUse" = @(
+                [ordered]@{
+                    "matcher" = "replace_file_content|multi_replace_file_content|write_to_file|edit_file|write_file|run_command"
+                    "hooks" = @(
+                        [ordered]@{
+                            "type" = "command"
+                            "command" = """$hookCmdPath"" PostToolUse"
+                            "timeout" = 4
+                        }
+                    )
+                }
+            )
         }
     }
 
     return ($hooksObj | ConvertTo-Json -Depth 10)
+}
+
+function Generate-WindowsMcpJson {
+    $mcpCmdPath = "%USERPROFILE%/.gemini/config/plugins/jev-coprocessor/bin/jev-mcp.cmd"
+    $mcpObj = [ordered]@{
+        "mcpServers" = [ordered]@{
+            "jev-context" = [ordered]@{
+                "command" = $mcpCmdPath
+                "args" = @()
+            }
+        }
+    }
+    return ($mcpObj | ConvertTo-Json -Depth 10)
 }
 
 function Remove-LegacyGlobalJevHooks {
@@ -272,7 +302,7 @@ function Stop-JevDaemon {
 }
 
 function Remove-LegacyMcpSchemas {
-    foreach ($productDir in @("antigravity", "antigravity-ide")) {
+    foreach ($productDir in @("antigravity", "antigravity-ide", "antigravity-cli")) {
         foreach ($legacyDir in @("jev-coprocessor-mcp", "jev-coprocessor_jev-coprocessor-mcp")) {
             $p = Join-Path $TargetHome ".gemini\$productDir\mcp\$legacyDir"
             if (Test-Path $p) {
@@ -282,21 +312,63 @@ function Remove-LegacyMcpSchemas {
     }
 }
 
+function Show-TelemetryStats {
+    $logFile = Join-Path $PluginDest "logs\jev-telemetry.jsonl"
+    if (-not (Test-Path $logFile)) {
+        Write-Yellow "No telemetry log found at $logFile"
+        return
+    }
+    $nodeExe = Find-NodeExecutable
+    if (-not $nodeExe) {
+        Write-Red "  x Node.js executable could not be resolved"
+        exit 1
+    }
+    Write-Cyan "Jev Co-Processor Telemetry Summary ($logFile):"
+    $script = @'
+const fs = require("node:fs");
+const lines = fs.readFileSync(process.argv[1], "utf8").trim().split(/\r?\n/).filter(Boolean);
+const counts = {};
+let apiCalls = 0, cachedHits = 0, totalLat = 0, latCount = 0, skipped = 0;
+for (const line of lines) {
+  let r;
+  try { r = JSON.parse(line); } catch (err) { skipped++; continue; }
+  counts[r.hook] = (counts[r.hook] || 0) + 1;
+  if (typeof r.latencyMs === "number") {
+    apiCalls++;
+    if (r.cached) cachedHits++;
+    else { totalLat += r.latencyMs; latCount++; }
+  }
+}
+const avgMs = latCount ? Math.round(totalLat / latCount) : 0;
+const cachePct = apiCalls ? ((cachedHits / apiCalls) * 100).toFixed(1) : "0.0";
+console.log(`  Total events:      ${lines.length}${skipped ? ` (${skipped} malformed skipped)` : ""}`);
+console.log(`  Jev evaluations:   ${apiCalls} (${cachedHits} cached, ${cachePct}% hit rate)`);
+console.log(`  Avg warm latency:  ${avgMs} ms`);
+console.log("  Events by hook:");
+for (const [k, v] of Object.entries(counts).sort((a, b) => b[1] - a[1])) {
+  console.log(`    - ${k}: ${v}`);
+}
+'@
+    & $nodeExe -e $script $logFile
+}
+
 function Run-SmokeCheck {
     Write-Cyan "Running Jev Co-Processor Windows health check..."
 
     $hookMjs = Join-Path $PluginDest "bin\jev-hook.mjs"
     $daemonMjs = Join-Path $PluginDest "bin\jev-daemon.mjs"
+    $mcpMjs = Join-Path $PluginDest "bin\jev-mcp.mjs"
+    $mcpCfg = Join-Path $PluginDest "mcp_config.json"
     $hookCmd = Join-Path $PluginDest "bin\jev-hook.cmd"
 
-    if (-not (Test-Path $hookMjs) -or -not (Test-Path $daemonMjs)) {
-        Write-Red "  x Plugin scripts incomplete at $PluginDest"
+    if (-not (Test-Path $hookMjs) -or -not (Test-Path $daemonMjs) -or -not (Test-Path $mcpMjs) -or -not (Test-Path $mcpCfg)) {
+        Write-Red "  x Plugin scripts or mcp_config.json incomplete at $PluginDest"
         exit 1
     }
-    Write-Green "  [OK] Plugin & warm daemon scripts present at $PluginDest"
+    Write-Green "  [OK] Plugin, warm daemon, & FTS5 MCP scripts present at $PluginDest"
 
     # Verify link into product directories
-    foreach ($productDir in @("antigravity", "antigravity-ide")) {
+    foreach ($productDir in @("antigravity", "antigravity-ide", "antigravity-cli")) {
         $agyDir = Join-Path $TargetHome ".gemini\$productDir"
         if (Test-Path $agyDir) {
             $pluginHooks = Join-Path $PluginDest "hooks.json"
@@ -309,14 +381,22 @@ function Run-SmokeCheck {
         }
     }
 
-    # Execute health check via jev-hook.cmd with test JSON on stdin
-    $testPayload = '{"conversationId":"install-health-check","stepIdx":1,"toolCall":{"name":"run_command","args":{"CommandLine":"go test ./... || true","Cwd":"C:\\"}}}'
-    
     $nodeExe = Find-NodeExecutable
     if (-not $nodeExe) {
         Write-Red "  x Node.js executable could not be resolved for smoke check"
         exit 1
     }
+
+    $mcpInit = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"check","version":"1.0"}}}'
+    $mcpOut = ($mcpInit | & $nodeExe --no-warnings --experimental-sqlite $mcpMjs 2>$null | Out-String).Trim()
+    if ($mcpOut -match '"jev-context-mcp"') {
+        Write-Green "  [OK] FTS5 MCP server (jev-context-mcp) initialize verified"
+    } else {
+        Write-Yellow "  ! FTS5 MCP server check returned unexpected output"
+    }
+
+    # Execute health check via jev-hook.cmd with test JSON on stdin
+    $testPayload = '{"conversationId":"install-health-check","stepIdx":1,"toolCall":{"name":"run_command","args":{"CommandLine":"go test ./... || true","Cwd":"C:\\"}}}'
 
     $out = $null
     try {
@@ -376,18 +456,27 @@ function Install-Plugin {
     Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\bin\jev-daemon.mjs") (Join-Path $destBin "jev-daemon.mjs") -Force
     Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\bin\jev-hook.mjs") (Join-Path $destBin "jev-hook.mjs") -Force
     Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\bin\jev-hook.cmd") (Join-Path $destBin "jev-hook.cmd") -Force
+    Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\bin\jev-mcp.mjs") (Join-Path $destBin "jev-mcp.mjs") -Force
+    Copy-Item (Join-Path $ScriptDir "plugins\jev-coprocessor\bin\jev-mcp.cmd") (Join-Path $destBin "jev-mcp.cmd") -Force
 
-    # Generate canonical plugin hooks.json and prune duplicate top-level Jev hook entries
+    # Generate canonical plugin hooks.json, mcp_config.json, and prune duplicate top-level Jev hook entries
     $hooksJsonContent = Generate-WindowsHooksJson
     $hooksJsonContent | Out-File -FilePath (Join-Path $PluginDest "hooks.json") -Encoding utf8 -Force
+    $mcpJsonContent = Generate-WindowsMcpJson
+    $mcpJsonContent | Out-File -FilePath (Join-Path $PluginDest "mcp_config.json") -Encoding utf8 -Force
+    Remove-Item (Join-Path $PluginDest ".mcp.json") -Force -ErrorAction SilentlyContinue
     Remove-LegacyGlobalJevHooks (Join-Path $ConfigDir "hooks.json")
 
     # Enable in config.json
     Update-ConfigJsonPlugin -Enable $true
     Write-Green "  [OK] Installed plugin and hooks to $ConfigDir"
 
-    # Integrate into ~/.gemini/antigravity and ~/.gemini/antigravity-ide
-    foreach ($productDir in @("antigravity", "antigravity-ide")) {
+    # Integrate into ~/.gemini/antigravity, antigravity-ide, and antigravity-cli (if present)
+    $productDirs = @("antigravity", "antigravity-ide")
+    if (Test-Path (Join-Path $TargetHome ".gemini\antigravity-cli")) {
+        $productDirs += "antigravity-cli"
+    }
+    foreach ($productDir in $productDirs) {
         $agyDir = Join-Path $TargetHome ".gemini\$productDir"
         $agyPlugins = Join-Path $agyDir "plugins"
         New-Item -ItemType Directory -Force -Path $agyPlugins | Out-Null
@@ -429,7 +518,7 @@ function Uninstall-Plugin {
     Stop-JevDaemon
     Remove-LegacyMcpSchemas
 
-    foreach ($productDir in @("antigravity", "antigravity-ide")) {
+    foreach ($productDir in @("antigravity", "antigravity-ide", "antigravity-cli")) {
         $agyDir = Join-Path $TargetHome ".gemini\$productDir"
         Remove-LegacyGlobalJevHooks (Join-Path $agyDir "hooks.json")
 
@@ -461,4 +550,5 @@ switch ($Mode) {
     'Install'   { Install-Plugin }
     'Uninstall' { Uninstall-Plugin }
     'Check'     { Run-SmokeCheck }
+    'Stats'     { Show-TelemetryStats }
 }

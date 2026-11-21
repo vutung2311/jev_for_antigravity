@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax check scripts
+        run: |
+          node --check plugins/jev-coprocessor/bin/jev-client.mjs
+          node --check plugins/jev-coprocessor/bin/jev-daemon.mjs
+          node --check plugins/jev-coprocessor/bin/jev-hook.mjs
+          node --check plugins/jev-coprocessor/bin/jev-mcp.mjs
+      - name: Shell syntax check (POSIX)
+        if: runner.os != 'Windows'
+        run: bash -n install.sh
+      - name: Run unit & integration tests
+        run: node --test test/jev.test.mjs

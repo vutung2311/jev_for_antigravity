@@ -65,6 +65,12 @@ cd jev_for_antigravity
 # Verify:
 ./install.sh --check
 
+# View telemetry stats (cache hit rate, avg latency, guardrails, log offloads):
+./install.sh --stats
+
+# Run automated tests:
+node --test test/jev.test.mjs
+
 # Uninstall cleanly:
 ./install.sh --uninstall
 ```
@@ -90,7 +96,12 @@ cd jev_for_antigravity
      - Uses `PreToolUse` `overwrite: { CommandLine: ... }` to **auto-sanitize** trailing `|| true` on test/build/linter commands and dynamically rewrite `sudo <cmd>` to `pkexec <cmd>` (or `run0 <cmd>` when `NoNewPrivs=1` is detected) in-place without burning an extra LLM retry turn.
 
 3. **Keep-Alive Local Co-Processor Daemon & 5m LRU/Atomic Cache (`jev-daemon.mjs`)**:
-   - Auto-spawns an idle-timeout background IPC daemon (Unix socket `/tmp/jev-coprocessor-v2-<uid>.sock` / Windows Named Pipe) maintaining a pre-warmed HTTPS Keep-Alive pool to `api.typesafe.ai` (**cutting API latency from ~470ms cold to ~215ms warm**), in-flight SHA-256 request coalescing, and an in-memory + atomic disk 5-minute response cache (`<1ms` hits).
+   - Auto-spawns an idle-timeout background IPC daemon (Unix socket `/tmp/jev-coprocessor-v2-<uid>.sock` / Windows Named Pipe) maintaining a pre-warmed HTTPS Keep-Alive pool to `api.typesafe.ai` (**cutting API latency from ~470ms cold to ~215ms warm**), in-flight SHA-256 request coalescing, automatic 24h `/tmp` stale file garbage collection, and an in-memory + atomic disk 5-minute response cache (`<1ms` hits).
+
+4. **Context-Mode Extensions (`PreToolUse`, `PostToolUse`, & Local FTS5 MCP `jev-mcp.mjs`)**:
+   - **Jev-Smart Unranked File Slicing & Log Offloading (`PreToolUse`)**: Slices unranked large (`>500` line) files to the Jev-selected symbol range (`L1-L250` fallback) and offloads noisy `run_command` outputs (regex fast-path + Jev `likely_produces_large_output`) to `/tmp/jev-logs/<convId>/step-<n>.log` while preserving exit codes and returning the last 80 lines.
+   - **Local SQLite FTS5 MCP (`jev-context` / `jev-mcp.mjs`)**: Exposes `jev_exec` (with automatic failure error-line highlights), `jev_index`, `jev_search` (BM25 + Jev System-1 relevance reranking), `jev_list_sources`, and `jev_clear` with 24h TTL pruning.
+   - **Persistent Compaction Memory (`PostToolUse` + `PreInvocation`)**: Tracks edited files, failed commands, and saved logs per conversation in `/tmp/jev-ctx/memory-<convId>.json` and re-injects only Jev-relevant entries on subsequent turns.
 
 ---
 

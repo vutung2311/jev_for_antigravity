@@ -60,6 +60,7 @@ Options:
   --install            Install or update the Jev plugin and hooks (default)
   --uninstall          Remove the Jev plugin and hooks from Antigravity
   --check              Verify installation status and test Jev API connectivity
+  --stats              Display telemetry summary from jev-telemetry.jsonl
   --api-key <KEY>      Configure TYPESAFE_API_KEY in environment and .env
   -h, --help           Show this help message
 EOF
@@ -77,6 +78,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --check)
             MODE="check"
+            shift
+            ;;
+        --stats)
+            MODE="stats"
             shift
             ;;
         --api-key)
@@ -212,20 +217,63 @@ stop_jev_daemon() {
 }
 
 cleanup_legacy_mcp_schemas() {
-    for agy_dir in "${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide"; do
+    local product_dirs=("${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide")
+    if [[ -d "${TARGET_HOME}/.gemini/antigravity-cli" ]]; then
+        product_dirs+=("${TARGET_HOME}/.gemini/antigravity-cli")
+    fi
+    for agy_dir in "${product_dirs[@]}"; do
         rm -rf "${agy_dir}/mcp/jev-coprocessor-mcp" "${agy_dir}/mcp/jev-coprocessor_jev-coprocessor-mcp" 2>/dev/null || true
     done
 }
 
+show_telemetry_stats() {
+    local log_file="${PLUGIN_DEST}/logs/jev-telemetry.jsonl"
+    if [[ ! -f "$log_file" ]]; then
+        echo -e "${YELLOW}No telemetry log found at ${log_file}${NC}"
+        return 0
+    fi
+    echo -e "${CYAN}Jev Co-Processor Telemetry Summary (${log_file}):${NC}"
+    node -e '
+const fs = require("node:fs");
+const lines = fs.readFileSync(process.argv[1], "utf8").trim().split(/\r?\n/).filter(Boolean);
+const counts = {};
+let apiCalls = 0, cachedHits = 0, totalLat = 0, latCount = 0, skipped = 0;
+for (const line of lines) {
+  let r;
+  try {
+    r = JSON.parse(line);
+  } catch (err) {
+    skipped++;
+    continue;
+  }
+  counts[r.hook] = (counts[r.hook] || 0) + 1;
+  if (typeof r.latencyMs === "number") {
+    apiCalls++;
+    if (r.cached) cachedHits++;
+    else { totalLat += r.latencyMs; latCount++; }
+  }
+}
+const avgMs = latCount ? Math.round(totalLat / latCount) : 0;
+const cachePct = apiCalls ? ((cachedHits / apiCalls) * 100).toFixed(1) : "0.0";
+console.log(`  Total events:      ${lines.length}${skipped ? ` (${skipped} malformed skipped)` : ""}`);
+console.log(`  Jev evaluations:   ${apiCalls} (${cachedHits} cached, ${cachePct}% hit rate)`);
+console.log(`  Avg warm latency:  ${avgMs} ms`);
+console.log("  Events by hook:");
+for (const [k, v] of Object.entries(counts).sort((a, b) => b[1] - a[1])) {
+  console.log(`    - ${k}: ${v}`);
+}
+' "$log_file"
+}
+
 run_smoke_check() {
     echo -e "${CYAN}Running Jev Co-Processor health check...${NC}"
-    if [[ ! -f "${PLUGIN_DEST}/bin/jev-hook.mjs" || ! -f "${PLUGIN_DEST}/bin/jev-daemon.mjs" ]]; then
-        echo -e "  ${RED}✗ Plugin scripts incomplete at ${PLUGIN_DEST}${NC}" >&2
+    if [[ ! -f "${PLUGIN_DEST}/bin/jev-hook.mjs" || ! -f "${PLUGIN_DEST}/bin/jev-daemon.mjs" || ! -f "${PLUGIN_DEST}/bin/jev-mcp.mjs" || ! -f "${PLUGIN_DEST}/mcp_config.json" ]]; then
+        echo -e "  ${RED}✗ Plugin scripts or mcp_config.json incomplete at ${PLUGIN_DEST}${NC}" >&2
         exit 1
     fi
-    echo -e "  ${GREEN}✓ Plugin & warm daemon scripts present at ${PLUGIN_DEST}${NC}"
+    echo -e "  ${GREEN}✓ Plugin, warm daemon, & FTS5 MCP scripts present at ${PLUGIN_DEST}${NC}"
 
-    for agy_dir in "${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide"; do
+    for agy_dir in "${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide" "${TARGET_HOME}/.gemini/antigravity-cli"; do
         if [[ -d "$agy_dir" ]]; then
             if [[ -d "${agy_dir}/plugins/jev-coprocessor" && -f "${PLUGIN_DEST}/hooks.json" ]]; then
                 echo -e "  ${GREEN}✓ Integrated into ${agy_dir}${NC}"
@@ -234,6 +282,14 @@ run_smoke_check() {
             fi
         fi
     done
+
+    local mcp_out
+    mcp_out="$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"check","version":"1.0"}}}\n' | node --no-warnings --experimental-sqlite "${PLUGIN_DEST}/bin/jev-mcp.mjs" 2>/dev/null || true)"
+    if echo "$mcp_out" | grep -q '"jev-context-mcp"'; then
+        echo -e "  ${GREEN}✓ FTS5 MCP server (jev-context-mcp) initialize verified${NC}"
+    else
+        echo -e "  ${YELLOW}! FTS5 MCP server check returned unexpected output${NC}"
+    fi
 
     local out
     out="$(node "${PLUGIN_DEST}/bin/jev-hook.mjs" PreToolUse <<'EOF'
@@ -274,14 +330,29 @@ const hooks = {
     "PreToolUse": [{
       "matcher": "replace_file_content|multi_replace_file_content|write_to_file|edit_file|write_file|read_file|view_file|run_command",
       "hooks": [{ "type": "command", "command": `"${hookCmd}" PreToolUse`, "timeout": 6 }]
+    }],
+    "PostToolUse": [{
+      "matcher": "replace_file_content|multi_replace_file_content|write_to_file|edit_file|write_file|run_command",
+      "hooks": [{ "type": "command", "command": `"${hookCmd}" PostToolUse`, "timeout": 4 }]
     }]
   }
 };
 fs.writeFileSync(process.argv[1], JSON.stringify(hooks, null, 2) + "\n", "utf8");
-' "${PLUGIN_DEST}/hooks.json"
+const mcpCfg = {
+  mcpServers: {
+    "jev-context": {
+      command: "%USERPROFILE%/.gemini/config/plugins/jev-coprocessor/bin/jev-mcp.cmd",
+      args: []
+    }
+  }
+};
+fs.writeFileSync(process.argv[2], JSON.stringify(mcpCfg, null, 2) + "\n", "utf8");
+' "${PLUGIN_DEST}/hooks.json" "${PLUGIN_DEST}/mcp_config.json"
     else
         cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/hooks.json" "${PLUGIN_DEST}/hooks.json"
+        cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/mcp_config.json" "${PLUGIN_DEST}/mcp_config.json"
     fi
+    rm -f "${PLUGIN_DEST}/.mcp.json"
 
     prune_global_jev_hooks "${CONFIG_DIR}/hooks.json"
 
@@ -291,15 +362,23 @@ fs.writeFileSync(process.argv[1], JSON.stringify(hooks, null, 2) + "\n", "utf8")
     cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-client.mjs" "${PLUGIN_DEST}/bin/jev-client.mjs"
     cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-daemon.mjs" "${PLUGIN_DEST}/bin/jev-daemon.mjs"
     cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-hook.mjs" "${PLUGIN_DEST}/bin/jev-hook.mjs"
-    chmod +x "${PLUGIN_DEST}/bin/jev-client.mjs" "${PLUGIN_DEST}/bin/jev-daemon.mjs" "${PLUGIN_DEST}/bin/jev-hook.mjs" 2>/dev/null || true
+    cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-mcp.mjs" "${PLUGIN_DEST}/bin/jev-mcp.mjs"
+    chmod +x "${PLUGIN_DEST}/bin/jev-client.mjs" "${PLUGIN_DEST}/bin/jev-daemon.mjs" "${PLUGIN_DEST}/bin/jev-hook.mjs" "${PLUGIN_DEST}/bin/jev-mcp.mjs" 2>/dev/null || true
     if [[ -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-hook.cmd" ]]; then
         cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-hook.cmd" "${PLUGIN_DEST}/bin/jev-hook.cmd"
+    fi
+    if [[ -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-mcp.cmd" ]]; then
+        cp -f "${SCRIPT_DIR}/plugins/jev-coprocessor/bin/jev-mcp.cmd" "${PLUGIN_DEST}/bin/jev-mcp.cmd"
     fi
 
     enable_plugin_in_config "true"
     echo -e "  ${GREEN}✓ Installed plugin and hooks to ${PLUGIN_DEST}${NC}"
 
-    for agy_dir in "${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide"; do
+    local product_dirs=("${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide")
+    if [[ -d "${TARGET_HOME}/.gemini/antigravity-cli" ]]; then
+        product_dirs+=("${TARGET_HOME}/.gemini/antigravity-cli")
+    fi
+    for agy_dir in "${product_dirs[@]}"; do
         mkdir -p "${agy_dir}/plugins"
         prune_global_jev_hooks "${agy_dir}/hooks.json"
         if [[ "$IS_WINDOWS" == "true" ]]; then
@@ -321,7 +400,11 @@ uninstall_plugin() {
     echo -e "${CYAN}Uninstalling Jev System One Co-Processor...${NC}"
     stop_jev_daemon
     cleanup_legacy_mcp_schemas
-    for agy_dir in "${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide"; do
+    local product_dirs=("${TARGET_HOME}/.gemini/antigravity" "${TARGET_HOME}/.gemini/antigravity-ide")
+    if [[ -d "${TARGET_HOME}/.gemini/antigravity-cli" ]]; then
+        product_dirs+=("${TARGET_HOME}/.gemini/antigravity-cli")
+    fi
+    for agy_dir in "${product_dirs[@]}"; do
         prune_global_jev_hooks "${agy_dir}/hooks.json"
         rm -rf "${agy_dir}/plugins/jev-coprocessor"
     done
@@ -340,5 +423,8 @@ case "$MODE" in
         ;;
     check)
         run_smoke_check
+        ;;
+    stats)
+        show_telemetry_stats
         ;;
 esac

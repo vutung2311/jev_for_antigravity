@@ -21,7 +21,12 @@ Integrates TypeSafe's **Jev** (`jev-latest`, System One model) into Antigravity 
      - Auto-sanitizes trailing `|| true` on test/build/linter commands and rewrites `sudo <cmd>` to `pkexec <cmd>` (or `run0 <cmd>` when `NoNewPrivs=1` is detected) via `overwrite: { CommandLine }`.
 
 3. **Keep-Alive Local Co-Processor Daemon & 5m LRU/Atomic Cache (`jev-daemon.mjs`)**:
-   - Maintains a pre-warmed HTTPS Keep-Alive pool over Unix socket / Windows Named Pipe (**~215ms warm vs ~470ms cold**), in-flight SHA-256 request coalescing, 5 MB telemetry log rotation, and a 5-minute in-memory + atomic disk response cache (`<1ms` hits).
+   - Maintains a pre-warmed HTTPS Keep-Alive pool over Unix socket / Windows Named Pipe (**~215ms warm vs ~470ms cold**), in-flight SHA-256 request coalescing, 24h `/tmp` garbage collection, 5 MB telemetry log rotation, and a 5-minute in-memory + atomic disk response cache (`<1ms` hits).
+
+4. **Context-Mode Extensions (`PreToolUse`, `PostToolUse`, & `jev-mcp.mjs`)**:
+   - Jev-smart symbol slicing on unranked large files and noisy `run_command` log offloading (`/tmp/jev-logs/`).
+   - Local SQLite FTS5 MCP server (`jev_exec`, `jev_index`, `jev_search` with Jev reranking, `jev_list_sources`, `jev_clear`).
+   - Persistent per-conversation `PostToolUse` session memory filtered by Jev on `PreInvocation`.
 
 ## Setup
 
