@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "jev-context": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "node --no-warnings --experimental-sqlite \"$HOME/.gemini/config/plugins/jev-coprocessor/bin/jev-mcp.mjs\""
+      ]
+    }
+  }
+}

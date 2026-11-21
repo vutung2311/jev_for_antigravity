@@ -10,9 +10,49 @@ const INDEX_DIR = path.join(os.tmpdir(), 'jev-ctx');
 const DB_PATH = path.join(INDEX_DIR, 'fts-index.sqlite');
 const CHUNK_LINES = 40;
 const CHUNK_OVERLAP = 5;
+const SOURCE_TTL_MS = 24 * 60 * 60 * 1000;
 
 let sqliteDb = null;
 const memoryChunks = [];
+const memorySources = new Map();
+
+function pruneExpiredSources() {
+  const cutoff = Date.now() - SOURCE_TTL_MS;
+  if (sqliteDb) {
+    const expired = sqliteDb
+      .prepare('SELECT source_id FROM sources WHERE created_at < ?')
+      .all(cutoff);
+    if (expired.length === 0) return;
+    sqliteDb.exec('BEGIN');
+    try {
+      const delChunks = sqliteDb.prepare('DELETE FROM chunks WHERE source_id = ?');
+      const delSource = sqliteDb.prepare('DELETE FROM sources WHERE source_id = ?');
+      for (const row of expired) {
+        delChunks.run(row.source_id);
+        delSource.run(row.source_id);
+      }
+      sqliteDb.exec('COMMIT');
+    } catch (err) {
+      sqliteDb.exec('ROLLBACK');
+      throw err;
+    }
+    return;
+  }
+  const expiredIds = new Set();
+  for (const [id, meta] of memorySources.entries()) {
+    if (meta.createdAt < cutoff) {
+      expiredIds.add(id);
+      memorySources.delete(id);
+    }
+  }
+  if (expiredIds.size > 0) {
+    for (let i = memoryChunks.length - 1; i >= 0; i--) {
+      if (expiredIds.has(memoryChunks[i].sourceId)) {
+        memoryChunks.splice(i, 1);
+      }
+    }
+  }
+}
 
 async function initStore() {
   fs.mkdirSync(INDEX_DIR, { recursive: true });
@@ -20,6 +60,8 @@ async function initStore() {
     const { DatabaseSync } = await import('node:sqlite');
     sqliteDb = new DatabaseSync(DB_PATH);
     sqliteDb.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 5000;
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
         source_id UNINDEXED,
         label UNINDEXED,
@@ -27,8 +69,17 @@ async function initStore() {
         line_end UNINDEXED,
         body
       );
+      CREATE TABLE IF NOT EXISTS sources (
+        source_id TEXT PRIMARY KEY,
+        label TEXT,
+        line_count INTEGER,
+        chunk_count INTEGER,
+        created_at INTEGER
+      );
     `);
-  } catch {
+    pruneExpiredSources();
+  } catch (err) {
+    process.stderr.write(`jev-mcp sqlite unavailable, using memory store: ${err?.message || err}\n`);
     sqliteDb = null;
   }
 }
@@ -50,20 +101,93 @@ function chunkText(text, sourceId, label) {
     });
     if (i + CHUNK_LINES >= lines.length) break;
   }
-  return { totalLines: lines.length, chunks };
+  return { lines, totalLines: lines.length, chunks };
 }
 
-function insertChunks(chunks) {
+function insertChunks(chunks, meta) {
+  const now = Date.now();
   if (sqliteDb) {
-    const stmt = sqliteDb.prepare(
-      'INSERT INTO chunks (source_id, label, line_start, line_end, body) VALUES (?, ?, ?, ?, ?)'
-    );
-    for (const c of chunks) {
-      stmt.run(c.sourceId, c.label, c.lineStart, c.lineEnd, c.body);
+    sqliteDb.exec('BEGIN');
+    try {
+      if (meta?.sourceId) {
+        sqliteDb.prepare('DELETE FROM chunks WHERE source_id = ?').run(meta.sourceId);
+      }
+      const stmt = sqliteDb.prepare(
+        'INSERT INTO chunks (source_id, label, line_start, line_end, body) VALUES (?, ?, ?, ?, ?)'
+      );
+      for (const c of chunks) {
+        stmt.run(c.sourceId, c.label, c.lineStart, c.lineEnd, c.body);
+      }
+      if (meta) {
+        sqliteDb
+          .prepare(
+            'INSERT OR REPLACE INTO sources (source_id, label, line_count, chunk_count, created_at) VALUES (?, ?, ?, ?, ?)'
+          )
+          .run(meta.sourceId, meta.label, meta.totalLines, chunks.length, now);
+      }
+      sqliteDb.exec('COMMIT');
+    } catch (err) {
+      sqliteDb.exec('ROLLBACK');
+      throw err;
     }
     return;
   }
+  if (meta?.sourceId) {
+    for (let i = memoryChunks.length - 1; i >= 0; i--) {
+      if (memoryChunks[i].sourceId === meta.sourceId) {
+        memoryChunks.splice(i, 1);
+      }
+    }
+  }
   memoryChunks.push(...chunks);
+  if (meta) {
+    memorySources.set(meta.sourceId, {
+      sourceId: meta.sourceId,
+      label: meta.label,
+      lineCount: meta.totalLines,
+      chunkCount: chunks.length,
+      createdAt: now,
+    });
+  }
+}
+
+function listSources() {
+  pruneExpiredSources();
+  if (sqliteDb) {
+    return sqliteDb
+      .prepare('SELECT source_id, label, line_count, chunk_count, created_at FROM sources ORDER BY created_at DESC LIMIT 30')
+      .all()
+      .map((r) => ({
+        sourceId: r.source_id,
+        label: r.label,
+        lineCount: r.line_count,
+        chunkCount: r.chunk_count,
+        createdAt: r.created_at,
+      }));
+  }
+  return [...memorySources.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, 30);
+}
+
+function clearSources(sourceId) {
+  if (sqliteDb) {
+    if (sourceId) {
+      sqliteDb.prepare('DELETE FROM chunks WHERE source_id = ?').run(sourceId);
+      sqliteDb.prepare('DELETE FROM sources WHERE source_id = ?').run(sourceId);
+      return `Cleared source_id="${sourceId}"`;
+    }
+    sqliteDb.exec('DELETE FROM chunks; DELETE FROM sources;');
+    return 'Cleared all indexed sources';
+  }
+  if (sourceId) {
+    memorySources.delete(sourceId);
+    for (let i = memoryChunks.length - 1; i >= 0; i--) {
+      if (memoryChunks[i].sourceId === sourceId) memoryChunks.splice(i, 1);
+    }
+    return `Cleared source_id="${sourceId}"`;
+  }
+  memorySources.clear();
+  memoryChunks.length = 0;
+  return 'Cleared all indexed sources';
 }
 
 function queryStore(query, sourceId, limit = 8) {
@@ -81,16 +205,21 @@ function queryStore(query, sourceId, limit = 8) {
          FROM chunks WHERE chunks MATCH ? AND source_id = ? ORDER BY rank LIMIT ?`
       : `SELECT source_id, label, line_start, line_end, body, bm25(chunks) AS rank
          FROM chunks WHERE chunks MATCH ? ORDER BY rank LIMIT ?`;
-    const rows = sourceId
-      ? sqliteDb.prepare(sql).all(ftsQuery, sourceId, limit)
-      : sqliteDb.prepare(sql).all(ftsQuery, limit);
-    return rows.map((r) => ({
-      sourceId: r.source_id,
-      label: r.label,
-      lineStart: r.line_start,
-      lineEnd: r.line_end,
-      body: r.body,
-    }));
+    try {
+      const rows = sourceId
+        ? sqliteDb.prepare(sql).all(ftsQuery, sourceId, limit)
+        : sqliteDb.prepare(sql).all(ftsQuery, limit);
+      return rows.map((r) => ({
+        sourceId: r.source_id,
+        label: r.label,
+        lineStart: r.line_start,
+        lineEnd: r.line_end,
+        body: r.body,
+      }));
+    } catch (err) {
+      process.stderr.write(`jev-mcp fts query error: ${err?.message || err}\n`);
+      return [];
+    }
   }
 
   const lowerTerms = terms.map((t) => t.toLowerCase());
@@ -154,10 +283,16 @@ function runShellCommand(command, cwd, timeoutMs = 30000) {
       command,
       { cwd: cwd || process.cwd(), timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
       (error, stdout, stderr) => {
-        const exitCode = error && typeof error.code === 'number' ? error.code : 0;
+        const exitCode = error
+          ? typeof error.code === 'number'
+            ? error.code
+            : 1
+          : 0;
+        const timedOut = Boolean(error?.killed);
+        const timeoutNote = timedOut ? `\n[jev_exec] Command timed out after ${timeoutMs}ms` : '';
         resolve({
           exitCode,
-          combined: `${stdout || ''}${stderr ? `\n[stderr]\n${stderr}` : ''}`,
+          combined: `${stdout || ''}${stderr ? `\n[stderr]\n${stderr}` : ''}${timeoutNote}`,
         });
       }
     );
@@ -170,16 +305,36 @@ async function handleToolCall(name, args) {
     if (!command) {
       return { content: [{ type: 'text', text: 'Missing required argument: command' }], isError: true };
     }
-    const timeoutMs = Math.min(Number(args?.timeout_ms) || 30000, 120000);
+    const rawTimeout = Number(args?.timeout_ms);
+    const timeoutMs =
+      Number.isFinite(rawTimeout) && rawTimeout > 0
+        ? Math.max(100, Math.min(rawTimeout, 120000))
+        : 30000;
     const { exitCode, combined } = await runShellCommand(command, args?.cwd, timeoutMs);
     const sourceId = `exec-${Date.now()}`;
-    const { totalLines, chunks } = chunkText(combined, sourceId, command.slice(0, 80));
-    insertChunks(chunks);
+    const { lines, totalLines, chunks } = chunkText(combined, sourceId, command.slice(0, 80));
+    insertChunks(chunks, { sourceId, label: command.slice(0, 80), totalLines });
 
-    const lines = combined.split(/\r?\n/);
     const tail = lines.slice(-25).join('\n');
+    const errorHighlights =
+      exitCode !== 0 && totalLines > 25
+        ? lines
+            .map((text, idx) => ({ line: idx + 1, text: text.trim() }))
+            .filter(
+              (item) =>
+                item.text &&
+                /\b(error|fail(?:ed)?|panic|exception|traceback|fatal|assert(?:ion)?)\b/i.test(
+                  item.text
+                )
+            )
+            .slice(0, 8)
+            .map((item) => `L${item.line}: ${item.text.slice(0, 140)}`)
+        : [];
     const summary = [
       `[jev_exec] exit=${exitCode} lines=${totalLines} bytes=${Buffer.byteLength(combined, 'utf8')} chunks=${chunks.length} source_id=${sourceId}`,
+      ...(errorHighlights.length > 0
+        ? ['--- Key error lines ---', ...errorHighlights]
+        : []),
       totalLines > 25
         ? `--- Last 25 lines (use jev_search with source_id="${sourceId}" to query earlier output) ---`
         : '--- Output ---',
@@ -193,10 +348,17 @@ async function handleToolCall(name, args) {
     if (!filePath || !fs.existsSync(filePath)) {
       return { content: [{ type: 'text', text: `File not found: ${filePath}` }], isError: true };
     }
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size > 20 * 1024 * 1024) {
+      return {
+        content: [{ type: 'text', text: `File must be a regular file <= 20 MB: ${filePath}` }],
+        isError: true,
+      };
+    }
     const raw = fs.readFileSync(filePath, 'utf8');
     const sourceId = args?.source_id ? String(args.source_id) : `file-${path.basename(filePath)}-${Date.now()}`;
     const { totalLines, chunks } = chunkText(raw, sourceId, filePath);
-    insertChunks(chunks);
+    insertChunks(chunks, { sourceId, label: filePath, totalLines });
     return {
       content: [
         {
@@ -205,6 +367,22 @@ async function handleToolCall(name, args) {
         },
       ],
     };
+  }
+
+  if (name === 'jev_list_sources') {
+    const sources = listSources();
+    if (sources.length === 0) {
+      return { content: [{ type: 'text', text: '[jev_list_sources] No indexed sources.' }] };
+    }
+    const text = sources
+      .map((s) => `- ${s.sourceId} (${s.lineCount} lines, ${s.chunkCount} chunks): ${s.label}`)
+      .join('\n');
+    return { content: [{ type: 'text', text }] };
+  }
+
+  if (name === 'jev_clear') {
+    const msg = clearSources(args?.source_id ? String(args.source_id) : null);
+    return { content: [{ type: 'text', text: `[jev_clear] ${msg}` }] };
   }
 
   if (name === 'jev_search') {
@@ -270,6 +448,24 @@ const TOOLS = [
       required: ['query'],
     },
   },
+  {
+    name: 'jev_list_sources',
+    description: 'List currently indexed FTS5 sources (auto-pruned after 24 hours).',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'jev_clear',
+    description: 'Clear a specific source_id or all indexed sources from the local FTS5 store.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source_id: { type: 'string', description: 'Optional source_id to remove; omit to clear all' },
+      },
+    },
+  },
 ];
 
 function send(msg) {
@@ -303,8 +499,16 @@ async function main() {
     } else if (method === 'tools/list') {
       send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
     } else if (method === 'tools/call') {
-      const result = await handleToolCall(params?.name, params?.arguments || {});
-      send({ jsonrpc: '2.0', id, result });
+      try {
+        const result = await handleToolCall(params?.name, params?.arguments || {});
+        send({ jsonrpc: '2.0', id, result });
+      } catch (err) {
+        send({
+          jsonrpc: '2.0',
+          id,
+          error: { code: -32000, message: `Tool call failed: ${err?.message || err}` },
+        });
+      }
     } else if (id !== undefined) {
       send({
         jsonrpc: '2.0',

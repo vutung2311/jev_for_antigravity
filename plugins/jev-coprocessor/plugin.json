@@ -1,8 +1,8 @@
 {
   "name": "jev-coprocessor",
   "displayName": "Jev System One Co-Processor",
-  "version": "1.0.0",
-  "description": "Fast (~100ms) TypeSafe System One (Jev) co-processor for Antigravity: intent routing, code & command guardrails, diff auditing, and candidate reranking.",
+  "version": "1.1.0",
+  "description": "Fast (~200ms) TypeSafe System One (Jev) co-processor for Antigravity: intent routing, code & command guardrails, Jev-smart file slicing, noisy log offloading, SQLite FTS5 MCP (jev-context), and persistent session memory.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Audit my current git diff with Jev System One code guardrails",
