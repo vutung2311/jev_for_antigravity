@@ -224,6 +224,10 @@ function getSubagentInitialMessage(payload) {
 }
 
 function isControlArm(payload) {
+  const sessionState = getSessionState(payload?.conversationId);
+  if (typeof sessionState?.isControlArm === 'boolean') {
+    return sessionState.isControlArm;
+  }
   const transcriptPath = payload?.transcriptPath;
   if (transcriptPath && fs.existsSync(transcriptPath)) {
     try {
@@ -232,32 +236,40 @@ function isControlArm(payload) {
       const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
       fs.closeSync(fd);
       const head = buf.slice(0, bytesRead).toString('utf8');
-      if (
+      const matched =
         head.includes('JEV_DISABLE') ||
         head.includes('ARM_CONTROL_NO_JEV') ||
-        head.includes('BENCH_ARM_A')
-      ) {
-        return true;
-      }
-    } catch {
-      // fall through
+        head.includes('BENCH_ARM_A');
+      setSessionState(payload?.conversationId, {
+        ...(sessionState || {}),
+        isControlArm: matched,
+      });
+      return matched;
+    } catch (err) {
+      logTelemetry({ hook: 'ControlArm:read', error: String(err?.message || err) });
     }
   }
-  const initMsg = getSubagentInitialMessage(payload);
-  if (
-    initMsg &&
-    (initMsg.includes('JEV_DISABLE') ||
-      initMsg.includes('ARM_CONTROL_NO_JEV') ||
-      initMsg.includes('BENCH_ARM_A'))
-  ) {
-    return true;
+  if ((payload?.initialNumSteps ?? 0) <= 1) {
+    const initMsg = getSubagentInitialMessage(payload);
+    if (
+      initMsg &&
+      (initMsg.includes('JEV_DISABLE') ||
+        initMsg.includes('ARM_CONTROL_NO_JEV') ||
+        initMsg.includes('BENCH_ARM_A'))
+    ) {
+      setSessionState(payload?.conversationId, {
+        ...(sessionState || {}),
+        isControlArm: true,
+      });
+      return true;
+    }
   }
   return false;
 }
 
 function cleanPromptText(text) {
   return text
-    .replace(/^[\s\S]*?content=/m, '')
+    .replace(/^\[Message\][^\n]*?\bcontent=/m, '')
     .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/g, '')
     .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/g, '')
     .replace(/<!--[\s\S]*?-->/g, '')
@@ -1038,7 +1050,9 @@ function savePersistentMemory(conversationId, mem) {
   if (!p) return;
   try {
     fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(p, JSON.stringify({ ...mem, updatedAt: Date.now() }), 'utf8');
+    const tmpFile = `${p}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify({ ...mem, updatedAt: Date.now() }), 'utf8');
+    fs.renameSync(tmpFile, p);
   } catch (err) {
     logTelemetry({ hook: 'PostToolUse:memory_write', error: String(err?.message || err) });
   }
@@ -1070,9 +1084,10 @@ function handlePostToolUse(payload) {
       ].slice(0, 15);
     }
   } else if (toolName === 'run_command') {
-    const cmd = String(args?.CommandLine || '').trim();
-    if (payload?.error && cmd) {
-      const entry = `${cmd.slice(0, 100)} -> ${String(payload.error).slice(0, 100)}`;
+    const cmd = String(args?.CommandLine || '').replace(/\s+/g, ' ').trim();
+    const errText = String(payload?.error || '').replace(/\s+/g, ' ').trim();
+    if (errText && cmd && !/context canceled/i.test(errText)) {
+      const entry = `${cmd.slice(0, 100)} -> ${errText.slice(0, 100)}`;
       mem.failedCommands = [entry, ...mem.failedCommands].slice(0, 8);
     }
     const safeId = String(convId).replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -1100,13 +1115,15 @@ function setSessionState(conversationId, stateObj) {
   }
   try {
     const p = path.join(os.tmpdir(), `jev-session-${conversationId}.json`);
+    const tmpFile = `${p}.${process.pid}.tmp`;
     fs.writeFileSync(
-      p,
+      tmpFile,
       JSON.stringify({ ...stateObj, ts: Date.now() }),
       'utf8'
     );
-  } catch {
-    // ignore
+    fs.renameSync(tmpFile, p);
+  } catch (err) {
+    logTelemetry({ hook: 'SessionState:write', error: String(err?.message || err) });
   }
 }
 
@@ -1120,11 +1137,12 @@ function getSessionState(conversationId) {
       return null;
     }
     const data = JSON.parse(fs.readFileSync(p, 'utf8'));
-    if (Date.now() - (data?.ts || 0) > 180_000) {
+    if (Date.now() - (data?.ts || 0) > 1_800_000) {
       return null;
     }
     return data;
-  } catch {
+  } catch (err) {
+    logTelemetry({ hook: 'SessionState:read', error: String(err?.message || err) });
     return null;
   }
 }
@@ -1152,12 +1170,10 @@ async function handlePreInvocation(payload) {
       sessionState?.lastLoopBreakerTurn !== transcriptCtx.turnsSinceUserInput;
 
     if (shouldFireLoopBreaker) {
-      if (sessionState) {
-        setSessionState(payload?.conversationId, {
-          ...sessionState,
-          lastLoopBreakerTurn: transcriptCtx.turnsSinceUserInput,
-        });
-      }
+      setSessionState(payload?.conversationId, {
+        ...(sessionState || {}),
+        lastLoopBreakerTurn: transcriptCtx.turnsSinceUserInput,
+      });
       const savedFiles = (sessionState?.topFiles || [])
         .map((f) => `${f.file}${f.primaryRange ? ` (${f.primaryRange})` : ''}`)
         .join(', ');
@@ -1301,8 +1317,19 @@ async function handlePreInvocation(payload) {
     persistentMem.logFiles.length > 0;
   const memorySummary = hasPersistentMem
     ? {
-        edited_files: persistentMem.editedFiles.slice(0, 8).map((f) => path.basename(f)),
-        failed_commands: persistentMem.failedCommands.slice(0, 4),
+        edited_files: [
+          ...new Set(
+            persistentMem.editedFiles.slice(0, 8).map((f) => {
+              const rel = workspaceRoot && f.startsWith(workspaceRoot)
+                ? path.relative(workspaceRoot, f)
+                : path.basename(f);
+              return rel || path.basename(f);
+            })
+          ),
+        ],
+        failed_commands: persistentMem.failedCommands
+          .slice(0, 4)
+          .map((c) => c.replace(/\s+/g, ' ').trim()),
         saved_logs: persistentMem.logFiles.slice(0, 4),
       }
     : null;
@@ -1566,6 +1593,24 @@ async function capUnrankedLargeRead(readPath, sessionState, conversationId) {
     if (!stat.isFile() || stat.size < 20480) {
       return null;
     }
+    if (stat.size > 2 * 1024 * 1024) {
+      setSessionState(conversationId, {
+        ...(sessionState || {}),
+        autoCappedReads: [...(sessionState?.autoCappedReads || []), normRead],
+      });
+      logTelemetry({
+        hook: 'PreToolUse:read_cap_large',
+        targetFile: readPath,
+        fileBytes: stat.size,
+        capStart: 1,
+        capEnd: 250,
+        reason: 'fast_huge_file_cap',
+      });
+      return {
+        decision: 'allow',
+        overwrite: { StartLine: 1, EndLine: 250 },
+      };
+    }
     const content = fs.readFileSync(readPath, 'utf8');
     const totalLines = content.split(/\r?\n/).length;
     if (totalLines <= 500) {
@@ -1620,7 +1665,11 @@ async function capUnrankedLargeRead(readPath, sessionState, conversationId) {
         if (!Number.isNaN(idx) && parsedRanges[idx]) {
           const chosen = parsedRanges[idx];
           capStart = Math.max(1, chosen.start - 15);
-          capEnd = Math.min(totalLines, Math.max(chosen.end + 25, capStart + 140));
+          capEnd = Math.min(
+            totalLines,
+            capStart + 250,
+            Math.max(chosen.end + 25, capStart + 140)
+          );
           reason = `jev_symbol_slice_${idx}`;
         }
       } catch {
@@ -2000,7 +2049,11 @@ async function handlePreToolUse(payload) {
       /\bgit\b.*\bpush\b.*(\s--force\b|\s-f\b|\s--force-with-lease\b)/i.test(
         cmd
       );
-    const hasOrTrueTrigger = /\|\|\s*(true|:)\b/.test(cmd);
+    const hasOrTrueTrigger =
+      /\|\|\s*(true|:)\b/.test(cmd) &&
+      /\b(?:test|spec|lint|check|build|compile|vet|tsc|eslint|mypy|ruff|flake8|pytest|jest|vitest|cargo|go\s+(?:test|build|vet)|npm\s+run|make|gradle|mvn)\b/i.test(
+        cmd
+      );
     const hasSudoTrigger = /(^|[;&|]\s*)sudo\s+/.test(cmd);
 
     if (
@@ -2015,7 +2068,7 @@ async function handlePreToolUse(payload) {
       }
       const isTrivialReadOnlyCmd =
         cmd.length <= 18 ||
-        /^(?:ls|pwd|echo|which|whoami|date|uname|git\s+(?:status|branch|rev-parse|diff\s+--stat))\b/i.test(
+        /^(?:ls|pwd|echo|which|whoami|date|uname|mkdir|touch|cp|mv|chmod|cd|true|false|node\s+--check|git\s+(?:status|branch|rev-parse|diff\s+--stat|add|commit|push|fetch|pull|checkout|switch|stash|tag))\b/i.test(
           cmd
         );
       if (
