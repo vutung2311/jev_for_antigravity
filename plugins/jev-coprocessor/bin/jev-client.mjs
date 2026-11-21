@@ -145,14 +145,17 @@ export function writeCachedResponse(cacheKey, data) {
       store = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')) || {};
     }
     const now = Date.now();
-    for (const k of Object.keys(store)) {
-      if (now - (store[k]?.ts || 0) >= CACHE_TTL_MS) {
-        delete store[k];
+    const validEntries = [];
+    for (const [k, v] of Object.entries(store)) {
+      if (now - (v?.ts || 0) < CACHE_TTL_MS) {
+        validEntries.push([k, v]);
       }
     }
-    store[cacheKey] = { ts: now, data };
+    validEntries.sort((a, b) => (b[1]?.ts || 0) - (a[1]?.ts || 0));
+    const prunedStore = Object.fromEntries(validEntries.slice(0, 199));
+    prunedStore[cacheKey] = { ts: now, data };
     const tmpFile = `${CACHE_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmpFile, JSON.stringify(store), 'utf8');
+    fs.writeFileSync(tmpFile, JSON.stringify(prunedStore), 'utf8');
     fs.renameSync(tmpFile, CACHE_FILE);
     return true;
   } catch {
@@ -222,6 +225,7 @@ export async function directEvaluateSystemOne({
   questions,
   model,
   timeoutMs = 4500,
+  skipDiskWrite = false,
 }) {
   const cfg = loadEnv();
   if (!cfg.apiKey) {
@@ -264,7 +268,9 @@ export async function directEvaluateSystemOne({
       throw new Error(`TypeSafe HTTP ${response.status}: ${text}`);
     }
     const data = JSON.parse(text);
-    writeCachedResponse(cacheKey, data);
+    if (!skipDiskWrite) {
+      writeCachedResponse(cacheKey, data);
+    }
     return {
       ...data,
       latencyMs: Math.round(elapsedMs),

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import {
   CACHE_TTL_MS,
   DAEMON_SOCKET_PATH,
@@ -100,6 +102,7 @@ async function handleEvaluateRequest(payload) {
     questions: payload?.questions,
     model,
     timeoutMs: payload?.timeoutMs || 4500,
+    skipDiskWrite: true,
   });
   inflight.set(cacheKey, task);
 
@@ -109,7 +112,7 @@ async function handleEvaluateRequest(payload) {
     delete rawData.latencyMs;
     delete rawData.cached;
     setMemCache(cacheKey, rawData);
-    writeCachedResponse(cacheKey, rawData);
+    setImmediate(() => writeCachedResponse(cacheKey, rawData));
     return { ...result, warmDaemon: true };
   } finally {
     inflight.delete(cacheKey);
@@ -189,11 +192,46 @@ function probeExistingDaemon() {
   });
 }
 
+function sweepStaleTempFiles() {
+  const tmpDir = os.tmpdir();
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  try {
+    for (const name of fs.readdirSync(tmpDir)) {
+      if (
+        !name.startsWith('jev-session-') &&
+        !name.startsWith('jev-hook-last-step-')
+      ) {
+        continue;
+      }
+      const fullPath = path.join(tmpDir, name);
+      const stat = fs.statSync(fullPath);
+      if (stat.mtimeMs < cutoff) {
+        fs.unlinkSync(fullPath);
+      }
+    }
+    for (const sub of ['jev-logs', 'jev-ctx']) {
+      const dir = path.join(tmpDir, sub);
+      if (!fs.existsSync(dir)) continue;
+      for (const entry of fs.readdirSync(dir)) {
+        if (entry === 'fts-index.sqlite') continue;
+        const fullPath = path.join(dir, entry);
+        const stat = fs.statSync(fullPath);
+        if (stat.mtimeMs < cutoff) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        }
+      }
+    }
+  } catch (err) {
+    process.stderr.write(`jev-daemon temp sweep warning: ${err?.message || err}\n`);
+  }
+}
+
 async function startDaemon() {
   const alreadyAlive = await probeExistingDaemon();
   if (alreadyAlive) {
     process.exit(0);
   }
+  sweepStaleTempFiles();
   cleanupSocketFile();
   server.on('error', () => {
     process.exit(0);
